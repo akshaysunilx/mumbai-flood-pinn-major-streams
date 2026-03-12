@@ -1,0 +1,946 @@
+# ============================================================
+# Mumbai Flood PINN - Multi-Rainfall-Case Simulation
+# Single-file Colab script
+# ============================================================
+
+# Install once in Colab:
+# !pip install rasterio geopandas shapely scipy pillow matplotlib -q
+
+import os
+import io
+import re
+import math
+import gc
+import warnings
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from PIL import Image
+from scipy.interpolate import RegularGridInterpolator
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIG
+# ============================================================
+DEM_PATH = "/content/Mumbai_DEM.tif"
+GEOJSON_PATH = "/content/Entire_Mumbai_Outline.geojson"
+OUT_DIR = "/content/mumbai_multicase_outputs"
+
+# ---- Training ----
+# For quick demo use 300-500
+# For better results use 1000-3000
+EPOCHS_PER_CASE = 400
+N_INT = 5000
+N_IC = 1200
+N_BC = 400
+N_OBS = 400
+
+# ---- Visualization ----
+GRID_RES = 180
+GIF_FRAMES = 48
+GIF_FPS = 8
+
+# ---- Physics ----
+T_END_SECONDS = 5400.0
+G = 9.81
+MANNING_N = 0.030
+SEA_LEVEL = 0.50
+
+SEED = 42
+
+# ============================================================
+# SCENARIOS
+# ============================================================
+# You can add/edit cases here.
+SCENARIOS = [
+    {
+        "name": "Moderate_Widespread",
+        "peak_mmhr": 90.0,
+        "shield_amp": 0.95,
+        "band_amp": 0.55,
+        "cell_amp": 0.30,
+        "coast_amp": 0.22,
+        "corridor_amp": 0.20,
+        "shift_x": 0.00,
+        "shift_y": 0.00,
+        "temporal_shift": 0.00,
+        "duration_scale": 1.15,
+        "band_rotation": 0.00,
+    },
+    {
+        "name": "Heavy_Monsoon",
+        "peak_mmhr": 145.0,
+        "shield_amp": 1.05,
+        "band_amp": 0.75,
+        "cell_amp": 0.55,
+        "coast_amp": 0.35,
+        "corridor_amp": 0.30,
+        "shift_x": 0.00,
+        "shift_y": 0.00,
+        "temporal_shift": 0.00,
+        "duration_scale": 1.00,
+        "band_rotation": 0.00,
+    },
+    {
+        "name": "Extreme_Mithi_Corridor",
+        "peak_mmhr": 210.0,
+        "shield_amp": 0.95,
+        "band_amp": 0.85,
+        "cell_amp": 0.85,
+        "coast_amp": 0.28,
+        "corridor_amp": 0.55,
+        "shift_x": 0.03,
+        "shift_y": -0.02,
+        "temporal_shift": 0.03,
+        "duration_scale": 0.95,
+        "band_rotation": 0.08,
+    },
+    {
+        "name": "East_Shifted_Convective",
+        "peak_mmhr": 170.0,
+        "shield_amp": 0.85,
+        "band_amp": 0.60,
+        "cell_amp": 0.95,
+        "coast_amp": 0.18,
+        "corridor_amp": 0.22,
+        "shift_x": 0.10,
+        "shift_y": 0.01,
+        "temporal_shift": -0.02,
+        "duration_scale": 0.90,
+        "band_rotation": -0.06,
+    },
+]
+
+# ============================================================
+# SETUP
+# ============================================================
+os.makedirs(OUT_DIR, exist_ok=True)
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
+
+if not os.path.exists(DEM_PATH):
+    raise FileNotFoundError(f"DEM file not found: {DEM_PATH}")
+
+# ============================================================
+# HELPERS
+# ============================================================
+def slugify(text):
+    return re.sub(r"[^a-zA-Z0-9]+", "_", text.strip()).strip("_").lower()
+
+def rot_gauss_torch(x, y, xc, yc, sx, sy, theta_rad):
+    ct = math.cos(theta_rad)
+    st = math.sin(theta_rad)
+    xr =  ct * (x - xc) + st * (y - yc)
+    yr = -st * (x - xc) + ct * (y - yc)
+    return torch.exp(-0.5 * ((xr / sx) ** 2 + (yr / sy) ** 2))
+
+# ============================================================
+# RAINFALL CASE BUILDER
+# ============================================================
+def build_rainfall_fn(case):
+    peak_mmhr = float(case.get("peak_mmhr", 140.0))
+    shield_amp = float(case.get("shield_amp", 1.0))
+    band_amp = float(case.get("band_amp", 0.7))
+    cell_amp = float(case.get("cell_amp", 0.5))
+    coast_amp = float(case.get("coast_amp", 0.3))
+    corridor_amp = float(case.get("corridor_amp", 0.25))
+    shift_x = float(case.get("shift_x", 0.0))
+    shift_y = float(case.get("shift_y", 0.0))
+    temporal_shift = float(case.get("temporal_shift", 0.0))
+    duration_scale = float(case.get("duration_scale", 1.0))
+    band_rotation = float(case.get("band_rotation", 0.0))
+
+    def rainfall(x, y, t):
+        """
+        Rainfall in m/s.
+        Inputs: normalized x, y, t in [0,1]
+        """
+        tt = torch.clamp(t + temporal_shift, 0.0, 1.0)
+
+        # Broad temporal envelope
+        s1 = 0.11 * duration_scale
+        s2 = 0.14 * duration_scale
+        s3 = 0.12 * duration_scale
+
+        p1 = torch.exp(-0.5 * ((tt - 0.22) / s1) ** 2)
+        p2 = torch.exp(-0.5 * ((tt - 0.48) / s2) ** 2)
+        p3 = torch.exp(-0.5 * ((tt - 0.74) / s3) ** 2)
+        temporal = 0.55 * p1 + 1.00 * p2 + 0.75 * p3
+        temporal = temporal * (0.92 + 0.08 * torch.sin(2.0 * np.pi * (2.5 * tt + 0.10)))
+
+        # Broad mesoscale shields
+        shield1 = rot_gauss_torch(
+            x, y,
+            0.38 + 0.10 * tt + shift_x,
+            0.72 - 0.06 * tt + shift_y,
+            0.28, 0.16, -0.55 + band_rotation
+        )
+        shield2 = rot_gauss_torch(
+            x, y,
+            0.58 - 0.06 * tt + shift_x,
+            0.50 + shift_y,
+            0.24, 0.18, -0.35 + band_rotation
+        )
+        mesoscale = 0.75 * shield1 + 0.55 * shield2
+
+        # Elongated rainbands
+        band1 = rot_gauss_torch(
+            x, y,
+            0.22 + 0.18 * tt + shift_x,
+            0.76 - 0.10 * tt + shift_y,
+            0.34, 0.055, -0.85 + band_rotation
+        )
+        band2 = rot_gauss_torch(
+            x, y,
+            0.30 + 0.16 * tt + shift_x,
+            0.58 - 0.06 * tt + shift_y,
+            0.30, 0.060, -0.80 + band_rotation
+        )
+        band3 = rot_gauss_torch(
+            x, y,
+            0.42 + 0.10 * tt + shift_x,
+            0.42 + shift_y,
+            0.26, 0.050, -0.72 + band_rotation
+        )
+        bands = 0.80 * band1 + 0.65 * band2 + 0.45 * band3
+
+        # Embedded convective cells
+        c1 = rot_gauss_torch(x, y, 0.18 + 0.22 * tt + shift_x, 0.82 - 0.14 * tt + shift_y, 0.060, 0.045, -0.30)
+        c2 = rot_gauss_torch(x, y, 0.32 + 0.18 * tt + shift_x, 0.68 - 0.10 * tt + shift_y, 0.055, 0.040,  0.10)
+        c3 = rot_gauss_torch(x, y, 0.48 + 0.10 * tt + shift_x, 0.56 - 0.05 * tt + shift_y, 0.050, 0.038, -0.20)
+        c4 = rot_gauss_torch(x, y, 0.62 - 0.06 * tt + shift_x, 0.44 + 0.02 * tt + shift_y, 0.052, 0.040,  0.35)
+        c5 = rot_gauss_torch(x, y, 0.72 - 0.10 * tt + shift_x, 0.30 + 0.05 * tt + shift_y, 0.060, 0.042, -0.15)
+        cells = 1.00 * c1 + 0.95 * c2 + 0.85 * c3 + 0.75 * c4 + 0.65 * c5
+
+        # Coastal + corridor enhancement
+        coast = torch.exp(-((x - (0.18 + 0.4 * shift_x)) / 0.22) ** 2) * (0.65 + 0.35 * y)
+        mithi_corridor = torch.exp(-((x - (0.50 + shift_x)) / 0.10) ** 2) * torch.exp(-((y - (0.42 + shift_y)) / 0.13) ** 2)
+        kurla_dharavi = torch.exp(-((x - (0.46 + shift_x)) / 0.08) ** 2) * torch.exp(-((y - (0.38 + shift_y)) / 0.08) ** 2)
+        thane_creek = torch.exp(-((x - (0.85 + shift_x)) / 0.10) ** 2) * torch.exp(-((y - (0.48 + shift_y)) / 0.12) ** 2)
+        corridor = 0.55 * mithi_corridor + 0.25 * kurla_dharavi + 0.20 * thane_creek
+
+        # Gentle large-scale gradient
+        gradient = 0.78 + 0.18 * y + 0.10 * (1.0 - x)
+
+        spatial = (
+            0.20
+            + shield_amp * 0.75 * mesoscale
+            + band_amp * 0.65 * bands
+            + cell_amp * 0.55 * cells
+            + coast_amp * coast
+            + corridor_amp * corridor
+        ) * gradient
+
+        rain_ms = (peak_mmhr / 1000.0 / 3600.0) * temporal * spatial
+        return rain_ms
+
+    return rainfall
+
+# ============================================================
+# DEM
+# ============================================================
+def load_dem(path):
+    import rasterio
+
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(np.float32)
+        bounds = src.bounds
+        nodata = src.nodata
+        h, w = arr.shape
+
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+
+    arr = np.nan_to_num(arr, nan=0.0)
+    arr[arr < -100] = 0.0
+
+    # Flip so y=0 is south, y=1 is north
+    arr_flip = np.flipud(arr)
+
+    lon_min, lon_max = float(bounds.left), float(bounds.right)
+    lat_min, lat_max = float(bounds.bottom), float(bounds.top)
+
+    mid_lat = 0.5 * (lat_min + lat_max)
+    x_len = (lon_max - lon_min) * 111000.0 * np.cos(np.deg2rad(mid_lat))
+    y_len = (lat_max - lat_min) * 111000.0
+
+    xg = np.linspace(0.0, 1.0, w)
+    yg = np.linspace(0.0, 1.0, h)
+
+    elev_interp = RegularGridInterpolator(
+        (yg, xg), arr_flip, bounds_error=False, fill_value=0.0
+    )
+
+    dzdy, dzdx = np.gradient(arr_flip, 1.0 / (h - 1), 1.0 / (w - 1))
+    sx = dzdx / x_len
+    sy = dzdy / y_len
+
+    sx_interp = RegularGridInterpolator((yg, xg), sx, bounds_error=False, fill_value=0.0)
+    sy_interp = RegularGridInterpolator((yg, xg), sy, bounds_error=False, fill_value=0.0)
+
+    dem = {
+        "arr": arr_flip,
+        "h": h,
+        "w": w,
+        "lon_min": lon_min,
+        "lon_max": lon_max,
+        "lat_min": lat_min,
+        "lat_max": lat_max,
+        "x_len": x_len,
+        "y_len": y_len,
+        "elev_interp": elev_interp,
+        "sx_interp": sx_interp,
+        "sy_interp": sy_interp,
+    }
+
+    print(f"[DEM] Size: {w} x {h}")
+    print(f"[DEM] Elevation range: {arr.min():.2f} to {arr.max():.2f} m")
+    print(f"[DOMAIN] X length: {x_len/1000:.2f} km | Y length: {y_len/1000:.2f} km")
+    return dem
+
+def interp_torch(interp_fn, x, y):
+    x_np = x.detach().cpu().numpy().ravel()
+    y_np = y.detach().cpu().numpy().ravel()
+    pts = np.stack([y_np, x_np], axis=-1)
+    z = interp_fn(pts).astype(np.float32)
+    return torch.tensor(z.reshape(x.shape), dtype=torch.float32, device=x.device)
+
+# ============================================================
+# OUTLINE
+# ============================================================
+def load_outline(path, dem):
+    if not os.path.exists(path):
+        print("[OUTLINE] GeoJSON not found. Proceeding without boundary mask.")
+        return None
+
+    import geopandas as gpd
+    from shapely.ops import unary_union
+    from shapely.prepared import prep
+
+    gdf = gpd.read_file(path)
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    geom = unary_union(gdf.geometry).buffer(0)
+    prep_geom = prep(geom)
+
+    polys = [geom] if geom.geom_type == "Polygon" else list(geom.geoms)
+    patches = []
+    for p in polys:
+        for ring in [p.exterior] + list(p.interiors):
+            lon, lat = np.array(ring.xy)
+            xn = (lon - dem["lon_min"]) / (dem["lon_max"] - dem["lon_min"])
+            yn = (lat - dem["lat_min"]) / (dem["lat_max"] - dem["lat_min"])
+            patches.append((xn, yn))
+
+    print(f"[OUTLINE] Loaded {len(polys)} polygon(s)")
+    return {"geom": geom, "prep": prep_geom, "patches": patches}
+
+def draw_outline(ax, outline, color="black", lw=1.2):
+    if outline is None:
+        return
+    for xn, yn in outline["patches"]:
+        ax.plot(xn, yn, color=color, lw=lw, zorder=10)
+
+def outline_mask(outline, dem, res):
+    if outline is None:
+        return None
+
+    xx, yy = np.meshgrid(np.linspace(0, 1, res), np.linspace(0, 1, res))
+    lon = dem["lon_min"] + xx * (dem["lon_max"] - dem["lon_min"])
+    lat = dem["lat_min"] + yy * (dem["lat_max"] - dem["lat_min"])
+
+    try:
+        from shapely import contains_xy
+        mask = contains_xy(outline["geom"], lon.ravel(), lat.ravel()).reshape(xx.shape)
+    except Exception:
+        from shapely.geometry import Point
+        mask = np.array([
+            outline["prep"].contains(Point(a, b))
+            for a, b in zip(lon.ravel(), lat.ravel())
+        ]).reshape(xx.shape)
+
+    return mask
+
+# ============================================================
+# MODEL
+# ============================================================
+class FloodPINN(nn.Module):
+    def __init__(self, hidden=128, layers=5, fourier=24):
+        super().__init__()
+        self.register_buffer("B", torch.randn(3, fourier) * 2.0)
+
+        in_dim = 3 + 2 * fourier
+        net = []
+        d = in_dim
+        for _ in range(layers):
+            net.append(nn.Linear(d, hidden))
+            net.append(nn.Tanh())
+            d = hidden
+        self.net = nn.Sequential(*net)
+
+        self.head_h = nn.Linear(hidden, 1)
+        self.head_u = nn.Linear(hidden, 1)
+        self.head_v = nn.Linear(hidden, 1)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        with torch.no_grad():
+            self.head_h.bias.fill_(-4.0)
+
+    def forward(self, x, y, t):
+        c = torch.stack([x, y, t], dim=-1)
+        proj = c @ self.B
+        ff = torch.cat([torch.sin(2 * np.pi * proj), torch.cos(2 * np.pi * proj)], dim=-1)
+        z = self.net(torch.cat([c, ff], dim=-1))
+
+        h = F.softplus(self.head_h(z)).squeeze(-1) + 1e-4
+        u = 3.0 * torch.tanh(self.head_u(z)).squeeze(-1)
+        v = 3.0 * torch.tanh(self.head_v(z)).squeeze(-1)
+        return h, u, v
+
+# ============================================================
+# SAMPLING
+# ============================================================
+def sample_uniform(n):
+    return (
+        torch.rand(n, device=DEVICE),
+        torch.rand(n, device=DEVICE),
+        torch.rand(n, device=DEVICE),
+    )
+
+def sample_ic(n):
+    return (
+        torch.rand(n, device=DEVICE),
+        torch.rand(n, device=DEVICE),
+        torch.zeros(n, device=DEVICE),
+    )
+
+def sample_bc(n):
+    t = torch.rand(n, device=DEVICE)
+    return {
+        "west":  (torch.zeros(n, device=DEVICE), torch.rand(n, device=DEVICE), t.clone()),
+        "east":  (torch.ones(n, device=DEVICE),  torch.rand(n, device=DEVICE), t.clone()),
+        "south": (torch.rand(n, device=DEVICE),  torch.zeros(n, device=DEVICE), t.clone()),
+        "north": (torch.rand(n, device=DEVICE),  torch.ones(n, device=DEVICE),  t.clone()),
+    }
+
+def sample_obs(n, rainfall_fn):
+    zones = [
+        (0.43, 0.38, 0.92),  # Dharavi
+        (0.55, 0.45, 0.88),  # Kurla
+        (0.12, 0.06, 0.85),  # Colaba
+        (0.88, 0.48, 0.80),  # Thane Creek
+        (0.30, 0.58, 0.62),  # Andheri side
+        (0.65, 0.56, 0.58),  # Powai side
+    ]
+
+    xs, ys, ts, hs = [], [], [], []
+    per = max(1, n // len(zones))
+
+    for zx, zy, risk in zones:
+        t = torch.rand(per, device=DEVICE)
+        x = torch.normal(zx, 0.012, (per,), device=DEVICE).clamp(0, 1)
+        y = torch.normal(zy, 0.012, (per,), device=DEVICE).clamp(0, 1)
+
+        rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+        h = 0.02 + 0.10 * risk + 0.0045 * risk * rain_mmhr
+        h = torch.clamp(h, 0.02, 2.5)
+
+        xs.append(x)
+        ys.append(y)
+        ts.append(t)
+        hs.append(h)
+
+    return torch.cat(xs), torch.cat(ys), torch.cat(ts), torch.cat(hs)
+
+# ============================================================
+# PHYSICS
+# ============================================================
+def grad(out, inp):
+    return torch.autograd.grad(
+        out, inp,
+        grad_outputs=torch.ones_like(out),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+
+def physics_residual(model, dem, rainfall_fn, x, y, t):
+    x = x.clone().detach().requires_grad_(True)
+    y = y.clone().detach().requires_grad_(True)
+    t = t.clone().detach().requires_grad_(True)
+
+    h, u, v = model(x, y, t)
+
+    dhdt = grad(h, t) / T_END_SECONDS
+    dhudx = grad(h * u, x) / dem["x_len"]
+    dhvdy = grad(h * v, y) / dem["y_len"]
+
+    dhu_dt = grad(h * u, t) / T_END_SECONDS
+    dhuu_dx = grad(h * u * u + 0.5 * G * h * h, x) / dem["x_len"]
+    dhuv_dy = grad(h * u * v, y) / dem["y_len"]
+
+    dhv_dt = grad(h * v, t) / T_END_SECONDS
+    dhuv_dx = grad(h * u * v, x) / dem["x_len"]
+    dhvv_dy = grad(h * v * v + 0.5 * G * h * h, y) / dem["y_len"]
+
+    sx = interp_torch(dem["sx_interp"], x, y)
+    sy = interp_torch(dem["sy_interp"], x, y)
+
+    rain = rainfall_fn(x, y, t)
+
+    speed = torch.sqrt(u * u + v * v + 1e-8)
+    h_safe = torch.clamp(h, min=1e-3)
+    n2 = MANNING_N ** 2
+
+    tau_x = G * n2 * u * speed / (h_safe ** (1.0 / 3.0))
+    tau_y = G * n2 * v * speed / (h_safe ** (1.0 / 3.0))
+
+    rc = dhdt + dhudx + dhvdy - rain
+    rx = dhu_dt + dhuu_dx + dhuv_dy + G * h * sx + tau_x
+    ry = dhv_dt + dhuv_dx + dhvv_dy + G * h * sy + tau_y
+
+    return rc, rx, ry
+
+def ic_loss(model):
+    x, y, t = sample_ic(N_IC)
+    h, u, v = model(x, y, t)
+    return ((h - 0.03) ** 2).mean() + (u ** 2).mean() + (v ** 2).mean()
+
+def bc_loss(model):
+    bc = sample_bc(N_BC)
+    loss = 0.0
+
+    x, y, t = bc["west"]
+    h, _, _ = model(x, y, t)
+    loss = loss + ((h - SEA_LEVEL) ** 2).mean()
+
+    x, y, t = bc["south"]
+    h, _, _ = model(x, y, t)
+    loss = loss + ((h - SEA_LEVEL) ** 2).mean()
+
+    x, y, t = bc["east"]
+    _, u, _ = model(x, y, t)
+    loss = loss + (u ** 2).mean()
+
+    x, y, t = bc["north"]
+    _, _, v = model(x, y, t)
+    loss = loss + (v ** 2).mean()
+
+    return loss
+
+def data_loss(model, rainfall_fn):
+    x, y, t, h_obs = sample_obs(N_OBS, rainfall_fn)
+    h, _, _ = model(x, y, t)
+    return ((h - h_obs) ** 2).mean()
+
+# ============================================================
+# TRAINING
+# ============================================================
+def train_model(model, dem, rainfall_fn, epochs):
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    history = {"epoch": [], "total": [], "pde": [], "ic": [], "bc": [], "data": []}
+    lam = {"pde": 1.0, "ic": 8.0, "bc": 4.0, "data": 16.0}
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[TRAIN] Parameters: {n_params:,}")
+
+    for ep in range(epochs):
+        optimizer.zero_grad()
+
+        x, y, t = sample_uniform(N_INT)
+        rc, rx, ry = physics_residual(model, dem, rainfall_fn, x, y, t)
+        lpde = ((rc ** 2).mean() + (rx ** 2).mean() + (ry ** 2).mean()) / 3.0
+        lic = ic_loss(model)
+        lbc = bc_loss(model)
+        ldata = data_loss(model, rainfall_fn)
+
+        loss = lam["pde"] * lpde + lam["ic"] * lic + lam["bc"] * lbc + lam["data"] * ldata
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        if ep % 50 == 0 or ep == epochs - 1:
+            print(
+                f"ep {ep:04d} | total={loss.item():.3e} | "
+                f"pde={lpde.item():.3e} | ic={lic.item():.3e} | "
+                f"bc={lbc.item():.3e} | data={ldata.item():.3e}"
+            )
+            history["epoch"].append(ep)
+            history["total"].append(loss.item())
+            history["pde"].append(lpde.item())
+            history["ic"].append(lic.item())
+            history["bc"].append(lbc.item())
+            history["data"].append(ldata.item())
+
+    return history
+
+# ============================================================
+# PREDICTION
+# ============================================================
+@torch.no_grad()
+def predict_field(model, t_norm, res):
+    xi = np.linspace(0, 1, res)
+    yi = np.linspace(0, 1, res)
+    xx, yy = np.meshgrid(xi, yi)
+
+    x = torch.tensor(xx.ravel(), dtype=torch.float32, device=DEVICE)
+    y = torch.tensor(yy.ravel(), dtype=torch.float32, device=DEVICE)
+    t = torch.full_like(x, float(t_norm))
+
+    h, u, v = model(x, y, t)
+    H = h.cpu().numpy().reshape(res, res)
+    U = u.cpu().numpy().reshape(res, res)
+    V = v.cpu().numpy().reshape(res, res)
+    return xi, yi, H, U, V
+
+@torch.no_grad()
+def rainfall_grid(rainfall_fn, t_norm, res):
+    xi = np.linspace(0.0, 1.0, res)
+    yi = np.linspace(0.0, 1.0, res)
+    xx, yy = np.meshgrid(xi, yi)
+
+    x = torch.tensor(xx.ravel(), dtype=torch.float32, device=DEVICE)
+    y = torch.tensor(yy.ravel(), dtype=torch.float32, device=DEVICE)
+    t = torch.full_like(x, float(t_norm))
+
+    r_ms = rainfall_fn(x, y, t)
+    R_mmhr = r_ms.cpu().numpy().reshape(res, res) * 1000.0 * 3600.0
+    return xi, yi, R_mmhr
+
+# ============================================================
+# PLOTTING
+# ============================================================
+def plot_loss(history, save_path, title):
+    plt.figure(figsize=(9, 4))
+    for k in ["total", "pde", "ic", "bc", "data"]:
+        plt.semilogy(history["epoch"], history[k], label=k)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"[SAVED] {save_path}")
+
+def plot_peak_depth_map(peak_H, outline, save_path, title, mask=None):
+    H = peak_H.copy()
+    if mask is not None:
+        H[~mask] = np.nan
+
+    vmax = max(0.5, float(np.nanpercentile(H, 99))) if np.isfinite(H).any() else 0.5
+
+    plt.figure(figsize=(7, 6))
+    ax = plt.gca()
+    im = ax.imshow(H[::-1], extent=[0, 1, 0, 1], cmap="turbo", vmin=0, vmax=vmax, aspect="auto")
+    draw_outline(ax, outline)
+    ax.set_title(title)
+    ax.set_xlabel("Normalized Easting")
+    ax.set_ylabel("Normalized Northing")
+    plt.colorbar(im, ax=ax, label="Peak inundation depth (m)")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+    print(f"[SAVED] {save_path}")
+
+def plot_summary_bar(summary_rows, save_path):
+    names = [r["case"] for r in summary_rows]
+    peak_rain = [r["peak_rain_mmhr"] for r in summary_rows]
+    peak_depth = [r["peak_depth_m"] for r in summary_rows]
+
+    x = np.arange(len(names))
+    w = 0.38
+
+    fig, ax1 = plt.subplots(figsize=(11, 5))
+    ax1.bar(x - w/2, peak_rain, width=w, label="Peak rainfall (mm/hr)")
+    ax1.set_ylabel("Peak rainfall (mm/hr)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names, rotation=20, ha="right")
+
+    ax2 = ax1.twinx()
+    ax2.bar(x + w/2, peak_depth, width=w, label="Peak depth (m)")
+    ax2.set_ylabel("Peak depth (m)")
+
+    ax1.set_title("Rainfall-case comparison")
+    ax1.grid(True, axis="y", alpha=0.25)
+
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+    print(f"[SAVED] {save_path}")
+
+# ============================================================
+# GIF MAKER
+# ============================================================
+def make_side_by_side_gif(
+    model,
+    dem,
+    outline,
+    rainfall_fn,
+    out_path,
+    grid_res=GRID_RES,
+    gif_frames=GIF_FRAMES,
+    gif_fps=GIF_FPS,
+    mask_outside=True,
+    add_velocity=False,
+    quiver_step=12,
+):
+    model.eval()
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    print(f"[GIF] Building {gif_frames} frames...")
+    tvals = np.linspace(0.0, 1.0, gif_frames)
+
+    mask = None
+    if outline is not None and mask_outside:
+        mask = outline_mask(outline, dem, grid_res)
+        print(f"[GIF] Boundary mask active: {100.0 * mask.mean():.1f}% inside domain")
+
+    rain_fields = []
+    depth_fields = []
+    u_fields = []
+    v_fields = []
+
+    rain_max = 20.0
+    depth_max = 0.5
+
+    # Precompute fields to stabilize color scale
+    for tn in tvals:
+        _, _, R = rainfall_grid(rainfall_fn, tn, grid_res)
+        _, _, H, U, V = predict_field(model, tn, grid_res)
+
+        if mask is not None:
+            R = R.copy()
+            H = H.copy()
+            U = U.copy()
+            V = V.copy()
+            R[~mask] = np.nan
+            H[~mask] = np.nan
+            U[~mask] = np.nan
+            V[~mask] = np.nan
+
+        rain_fields.append(R)
+        depth_fields.append(H)
+        u_fields.append(U)
+        v_fields.append(V)
+
+        if np.isfinite(R).any():
+            rain_max = max(rain_max, float(np.nanpercentile(R, 99)))
+        if np.isfinite(H).any():
+            depth_max = max(depth_max, float(np.nanpercentile(H, 99)))
+
+    print(f"[GIF] Rainfall scale: 0 to {rain_max:.1f} mm/hr")
+    print(f"[GIF] Depth scale: 0 to {depth_max:.2f} m")
+
+    # Peak depth map
+    depth_stack = np.stack([np.where(np.isfinite(H), H, -np.inf) for H in depth_fields], axis=0)
+    peak_H = np.max(depth_stack, axis=0)
+    peak_H[peak_H == -np.inf] = np.nan
+
+    frames = []
+    xi = np.linspace(0.0, 1.0, grid_res)
+    yi = np.linspace(0.0, 1.0, grid_res)
+
+    for i, tn in enumerate(tvals):
+        R = rain_fields[i]
+        H = depth_fields[i]
+        U = u_fields[i]
+        V = v_fields[i]
+
+        sim_minutes = (tn * T_END_SECONDS) / 60.0
+
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6), dpi=110)
+        ax1, ax2 = axes
+
+        # Left: rainfall
+        im1 = ax1.imshow(
+            R[::-1],
+            extent=[0, 1, 0, 1],
+            cmap="Blues",
+            vmin=0.0,
+            vmax=rain_max,
+            aspect="auto",
+        )
+        draw_outline(ax1, outline)
+        ax1.set_title(f"Spatial Rainfall\nTime = {sim_minutes:.1f} min")
+        ax1.set_xlabel("Normalized Easting")
+        ax1.set_ylabel("Normalized Northing")
+        cb1 = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+        cb1.set_label("Rainfall (mm/hr)")
+
+        # Right: inundation
+        im2 = ax2.imshow(
+            H[::-1],
+            extent=[0, 1, 0, 1],
+            cmap="turbo",
+            vmin=0.0,
+            vmax=depth_max,
+            aspect="auto",
+        )
+        draw_outline(ax2, outline)
+
+        if add_velocity:
+            xxq, yyq = np.meshgrid(xi[::quiver_step], yi[::quiver_step])
+            Uq = U[::quiver_step, ::quiver_step]
+            Vq = V[::quiver_step, ::quiver_step]
+            Hq = H[::quiver_step, ::quiver_step]
+            wet = np.isfinite(Hq) & (Hq > 0.05)
+            if np.any(wet):
+                ax2.quiver(xxq[wet], yyq[wet], Uq[wet], Vq[wet], color="k", scale=35, width=0.002)
+
+        ax2.set_title(f"Inundation Depth\nTime = {sim_minutes:.1f} min")
+        ax2.set_xlabel("Normalized Easting")
+        ax2.set_ylabel("Normalized Northing")
+        cb2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+        cb2.set_label("Depth (m)")
+
+        fig.suptitle(f"Mumbai Flood PINN | Frame {i+1}/{gif_frames}", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(Image.open(buf).convert("P", palette=Image.ADAPTIVE).copy())
+
+    frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=int(1000 / gif_fps),
+        loop=0,
+        optimize=True,
+    )
+
+    print(f"[SAVED] {out_path}")
+    return {
+        "mask": mask,
+        "peak_H": peak_H,
+        "peak_rain_mmhr": rain_max,
+        "peak_depth_m": depth_max,
+    }
+
+# ============================================================
+# RUN ONE CASE
+# ============================================================
+def run_case(case, dem, outline):
+    case_name = case["name"]
+    slug = slugify(case_name)
+    case_dir = os.path.join(OUT_DIR, slug)
+    os.makedirs(case_dir, exist_ok=True)
+
+    print("\n" + "=" * 70)
+    print(f"[CASE] {case_name}")
+    print("=" * 70)
+
+    rainfall_fn = build_rainfall_fn(case)
+
+    model = FloodPINN(hidden=128, layers=5, fourier=24).to(DEVICE)
+
+    history = train_model(model, dem, rainfall_fn, epochs=EPOCHS_PER_CASE)
+
+    model_path = os.path.join(case_dir, f"{slug}_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"[SAVED] {model_path}")
+
+    loss_path = os.path.join(case_dir, f"{slug}_loss.png")
+    plot_loss(history, loss_path, f"{case_name} - training loss")
+
+    gif_path = os.path.join(case_dir, f"{slug}_rainfall_vs_inundation.gif")
+    gif_info = make_side_by_side_gif(
+        model=model,
+        dem=dem,
+        outline=outline,
+        rainfall_fn=rainfall_fn,
+        out_path=gif_path,
+        grid_res=GRID_RES,
+        gif_frames=GIF_FRAMES,
+        gif_fps=GIF_FPS,
+        mask_outside=True,
+        add_velocity=False,
+    )
+
+    peak_map_path = os.path.join(case_dir, f"{slug}_peak_depth_map.png")
+    plot_peak_depth_map(
+        gif_info["peak_H"],
+        outline,
+        peak_map_path,
+        f"{case_name} - peak inundation depth",
+        mask=gif_info["mask"],
+    )
+
+    summary = {
+        "case": case_name,
+        "case_dir": case_dir,
+        "model_path": model_path,
+        "loss_plot": loss_path,
+        "gif_path": gif_path,
+        "peak_map_path": peak_map_path,
+        "peak_rain_mmhr": gif_info["peak_rain_mmhr"],
+        "peak_depth_m": gif_info["peak_depth_m"],
+    }
+
+    # Free memory
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return summary
+
+# ============================================================
+# MAIN
+# ============================================================
+dem = load_dem(DEM_PATH)
+outline = load_outline(GEOJSON_PATH, dem)
+
+all_summaries = []
+for case in SCENARIOS:
+    summary = run_case(case, dem, outline)
+    all_summaries.append(summary)
+
+summary_plot_path = os.path.join(OUT_DIR, "scenario_comparison.png")
+plot_summary_bar(all_summaries, summary_plot_path)
+
+print("\n" + "=" * 70)
+print("[DONE] Outputs created:")
+print("=" * 70)
+for s in all_summaries:
+    print(f"\nCase: {s['case']}")
+    print(f"  Model    : {s['model_path']}")
+    print(f"  Loss     : {s['loss_plot']}")
+    print(f"  Peak map : {s['peak_map_path']}")
+    print(f"  GIF      : {s['gif_path']}")
+    print(f"  Peak rain: {s['peak_rain_mmhr']:.1f} mm/hr")
+    print(f"  Peak depth: {s['peak_depth_m']:.2f} m")
+
+print(f"\nComparison plot: {summary_plot_path}")
