@@ -1,0 +1,2306 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ============================================================
+# Mumbai Flood PINN - structured hydraulic mesh version
+#
+# Complete end-to-end script:
+# - DEM loading
+# - D8 routing
+# - watershed delineation
+# - hydraulic mesh generation
+# - structured collocation sampling
+# - PINN training
+# - PNG maps
+# - combined GIF
+# - rainfall / inundation / speed / discharge GIFs
+# - GeoTIFF / CSV / NPZ exports
+#
+# This is still a PINN, not a finite-volume solver.
+# Corrected for cleaner hydraulic-style visuals:
+# - no cluttered quiver/streamline arrows by default
+# - D8 watershed-derived stream overlay retained on all PNGs/GIFs
+# - watershed boundaries shown subtly as context only
+# ============================================================
+
+# Install once in Colab if needed:
+# !pip install rasterio scipy pillow matplotlib -q
+
+import os
+import io
+import re
+import math
+import gc
+import csv
+import warnings
+from collections import deque
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from PIL import Image
+from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter, distance_transform_edt
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIG
+# ============================================================
+DEM_PATH = "/content/Mumbai_DEM.tif"
+OUT_DIR = "/content/mumbai_hydraulic_grid_pinn_outputs"
+
+# ---------------- Runtime / training ----------------
+EPOCHS_PER_CASE = 420
+N_INT = 18000
+N_IC = 3200
+N_BC = 1600
+N_OBS = 3200
+N_CH = 2600
+N_DRY = 2200
+N_ALIGN = 2600
+N_OCEAN = 2200
+N_PLUVIAL = 2400
+N_QGUIDE = 2200
+
+# Training mesh size for PDE collocation
+HYDRAULIC_MESH_M = 120.0
+MESH_JITTER_FRAC = 0.06
+
+# Visualization / output grid
+GRID_RES = 420
+GIF_FRAMES = 36
+GIF_FPS = 7
+PRED_BATCH_SIZE = 100000
+NATIVE_ANALYSIS_FRAMES = 20
+NUMERIC_CSV_RES = 280
+
+# ---------------- Terrain / display ----------------
+OVERLAY_DEM = True
+DEM_OVERLAY_MODE = "hillshade"
+DEM_OVERLAY_ALPHA = 0.42
+HILLSHADE_EXAG = 4.7
+
+SHOW_CONTOURS = True
+N_CONTOURS = 14
+CONTOUR_ALPHA = 0.28
+CONTOUR_LW = 0.34
+
+SHOW_STREAM_NETWORK = True
+STREAM_ACCUM_PERCENTILE = 99.10
+STREAM_ALPHA = 0.98
+STREAM_LW = 1.15
+
+SHOW_WATERSHED_BOUNDARIES = True
+WATERSHED_ALPHA = 0.42
+WATERSHED_LW = 0.52
+WATERSHED_COLOR = "darkgreen"
+
+SHOW_DOMAIN_BOUNDARY = True
+BOUNDARY_ALPHA = 0.95
+BOUNDARY_LW = 1.0
+
+SHOW_COASTLINE = True
+COASTLINE_ALPHA = 0.95
+COASTLINE_LW = 1.20
+COASTLINE_COLOR = "black"
+
+SHOW_SEA_FILL = True
+SEA_FILL_RGBA = (0.62, 0.80, 0.96, 0.28)
+
+SHOW_VELOCITY = False
+SHOW_STREAMLINES = False
+STREAMLINE_DENSITY = 1.45
+STREAMLINE_WIDTH = 0.66
+VELOCITY_QUIVER_STEP = 12
+VELOCITY_ALPHA = 0.60
+VELOCITY_SCALE = 26
+
+# ---------------- Wetness visualization ----------------
+WET_DEPTH_THRESHOLD = 0.030
+PEAK_MAP_WET_THRESHOLD = 0.020
+ARRIVAL_DEPTH_THRESHOLD = 0.050
+
+# ---------------- Model ----------------
+HIDDEN = 192
+LAYERS = 7
+FOURIER = 40
+TERRAIN_FEATURES = 8  # z_norm, slope_norm, acc_norm, lowland, dirx, diry, channel_strength, channel_prox
+
+# ---------------- Physics / sea ----------------
+T_END_SECONDS = 7200.0
+G = 9.81
+MANNING_N = 0.036
+
+SEA_LEVEL = 0.00
+SEA_ELEV_BUFFER = 0.55
+SEA_BASE_MAX = 6.0
+
+# ---------------- Outputs ----------------
+EXPORT_NATIVE_PEAK_TIFFS = True
+EXPORT_COARSE_NUMERIC_CSV = True
+EXPORT_NUMPY_CUBES = True
+EXPORT_NATIVE_OCEAN_MASK = True
+
+SEED = 42
+
+# Within-cell collocation offsets
+POINT_TEMPLATES = np.array([
+    [0.00, 0.00],
+    [0.25, 0.00], [-0.25, 0.00],
+    [0.00, 0.25], [0.00, -0.25],
+    [0.20, 0.20], [0.20, -0.20],
+    [-0.20, 0.20], [-0.20, -0.20],
+], dtype=np.float32)
+
+# ============================================================
+# SCENARIOS
+# ============================================================
+SCENARIOS = [
+    {
+        "name": "Moderate_Widespread",
+        "peak_mmhr": 95.0,
+        "citywide_amp": 1.10,
+        "shield_amp": 0.95,
+        "band_amp": 0.55,
+        "cell_amp": 0.26,
+        "coast_amp": 0.24,
+        "corridor_amp": 0.18,
+        "shift_x": 0.00,
+        "shift_y": 0.00,
+        "temporal_shift": 0.00,
+        "duration_scale": 1.15,
+        "band_rotation": 0.00,
+    },
+    {
+        "name": "Heavy_Monsoon_Citywide",
+        "peak_mmhr": 150.0,
+        "citywide_amp": 1.25,
+        "shield_amp": 1.05,
+        "band_amp": 0.72,
+        "cell_amp": 0.42,
+        "coast_amp": 0.34,
+        "corridor_amp": 0.24,
+        "shift_x": 0.00,
+        "shift_y": 0.00,
+        "temporal_shift": 0.00,
+        "duration_scale": 1.02,
+        "band_rotation": -0.02,
+    },
+    {
+        "name": "Extreme_Mithi_Corridor",
+        "peak_mmhr": 215.0,
+        "citywide_amp": 1.05,
+        "shield_amp": 0.96,
+        "band_amp": 0.86,
+        "cell_amp": 0.78,
+        "coast_amp": 0.28,
+        "corridor_amp": 0.56,
+        "shift_x": 0.03,
+        "shift_y": -0.02,
+        "temporal_shift": 0.03,
+        "duration_scale": 0.96,
+        "band_rotation": 0.08,
+    },
+    {
+        "name": "East_Shifted_Convective",
+        "peak_mmhr": 175.0,
+        "citywide_amp": 1.00,
+        "shield_amp": 0.88,
+        "band_amp": 0.62,
+        "cell_amp": 0.92,
+        "coast_amp": 0.20,
+        "corridor_amp": 0.24,
+        "shift_x": 0.10,
+        "shift_y": 0.01,
+        "temporal_shift": -0.02,
+        "duration_scale": 0.90,
+        "band_rotation": -0.06,
+    },
+]
+
+# ============================================================
+# SETUP
+# ============================================================
+os.makedirs(OUT_DIR, exist_ok=True)
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}")
+
+if not os.path.exists(DEM_PATH):
+    raise FileNotFoundError(f"DEM file not found: {DEM_PATH}")
+
+# ============================================================
+# HELPERS
+# ============================================================
+def slugify(text):
+    return re.sub(r"[^a-zA-Z0-9]+", "_", text.strip()).strip("_").lower()
+
+def safe_percentile(arr, q, default=0.0):
+    arr = np.asarray(arr)
+    valid = arr[np.isfinite(arr)]
+    if valid.size == 0:
+        return default
+    return float(np.nanpercentile(valid, q))
+
+def rot_gauss_torch(x, y, xc, yc, sx, sy, theta_rad):
+    ct = math.cos(theta_rad)
+    st = math.sin(theta_rad)
+    xr = ct * (x - xc) + st * (y - yc)
+    yr = -st * (x - xc) + ct * (y - yc)
+    return torch.exp(-0.5 * ((xr / sx) ** 2 + (yr / sy) ** 2))
+
+def get_plot_extent_km(dem):
+    return [0.0, dem["x_len"] / 1000.0, 0.0, dem["y_len"] / 1000.0]
+
+def get_panel_figsize(dem, base_h=5.8):
+    ratio = dem["x_len"] / max(dem["y_len"], 1e-6)
+    panel_w = max(5.8, min(11.0, base_h * ratio))
+    return panel_w, base_h
+
+def compute_contour_levels(z, n_levels=10):
+    z_valid = z[np.isfinite(z)]
+    if z_valid.size < 10:
+        return None
+    z1, z99 = np.nanpercentile(z_valid, [5, 95])
+    relief = z99 - z1
+    if relief <= 1e-6:
+        return None
+    levels = np.linspace(z1, z99, n_levels)
+    levels = np.unique(np.round(levels, 2))
+    if len(levels) < 2:
+        return None
+    return levels
+
+def shift_with_fill(arr, dr, dc, fill_value):
+    h, w = arr.shape
+    out = np.full((h, w), fill_value, dtype=arr.dtype)
+
+    src_r0 = max(0, -dr)
+    src_r1 = h - max(0, dr)
+    src_c0 = max(0, -dc)
+    src_c1 = w - max(0, dc)
+
+    dst_r0 = max(0, dr)
+    dst_r1 = h - max(0, -dr)
+    dst_c0 = max(0, dc)
+    dst_c1 = w - max(0, -dc)
+
+    out[dst_r0:dst_r1, dst_c0:dst_c1] = arr[src_r0:src_r1, src_c0:src_c1]
+    return out
+
+def weighted_mean_torch(values, weights, eps=1e-8):
+    return (values * weights).sum() / torch.clamp(weights.sum(), min=eps)
+
+def np_to_torch(x):
+    return torch.from_numpy(np.asarray(x, dtype=np.float32)).to(DEVICE)
+
+# ============================================================
+# DIFFERENTIABLE TORCH SAMPLERS
+# ============================================================
+def make_field_tensor(arr, device=DEVICE):
+    return torch.from_numpy(arr.astype(np.float32)[None, None, :, :]).to(device)
+
+def make_multi_tensor(arr_chw, device=DEVICE):
+    return torch.from_numpy(arr_chw.astype(np.float32)[None, :, :, :]).to(device)
+
+def sample_multi_field_torch(field_4d, x, y, mode="bilinear"):
+    _, C, H, W = field_4d.shape
+
+    xp = x * (W - 1)
+    yp = y * (H - 1)
+
+    x0 = torch.floor(xp).long().clamp(0, W - 2)
+    y0 = torch.floor(yp).long().clamp(0, H - 2)
+    x1 = (x0 + 1).clamp(0, W - 1)
+    y1 = (y0 + 1).clamp(0, H - 1)
+
+    wx1 = (xp - x0.float()).clamp(0.0, 1.0)
+    wy1 = (yp - y0.float()).clamp(0.0, 1.0)
+    wx0 = 1.0 - wx1
+    wy0 = 1.0 - wy1
+
+    field_flat = field_4d[0].reshape(C, -1)
+
+    idx_00 = y0 * W + x0
+    idx_01 = y0 * W + x1
+    idx_10 = y1 * W + x0
+    idx_11 = y1 * W + x1
+
+    v00 = field_flat[:, idx_00]
+    v01 = field_flat[:, idx_01]
+    v10 = field_flat[:, idx_10]
+    v11 = field_flat[:, idx_11]
+
+    out = (
+        v00 * (wy0 * wx0) +
+        v01 * (wy0 * wx1) +
+        v10 * (wy1 * wx0) +
+        v11 * (wy1 * wx1)
+    )
+    return out.T
+
+def sample_field_torch(field_4d, x, y, mode="bilinear"):
+    return sample_multi_field_torch(field_4d, x, y, mode=mode)[:, 0]
+
+def get_terrain_features_torch(dem, x, y):
+    return sample_multi_field_torch(dem["terrain_tensor"], x, y, mode="bilinear")
+
+# ============================================================
+# RAINFALL CASE BUILDER
+# ============================================================
+def build_rainfall_fn(case):
+    peak_mmhr = float(case.get("peak_mmhr", 140.0))
+    citywide_amp = float(case.get("citywide_amp", 1.0))
+    shield_amp = float(case.get("shield_amp", 1.0))
+    band_amp = float(case.get("band_amp", 0.7))
+    cell_amp = float(case.get("cell_amp", 0.5))
+    coast_amp = float(case.get("coast_amp", 0.3))
+    corridor_amp = float(case.get("corridor_amp", 0.25))
+    shift_x = float(case.get("shift_x", 0.0))
+    shift_y = float(case.get("shift_y", 0.0))
+    temporal_shift = float(case.get("temporal_shift", 0.0))
+    duration_scale = float(case.get("duration_scale", 1.0))
+    band_rotation = float(case.get("band_rotation", 0.0))
+
+    def rainfall(x, y, t):
+        tt = torch.clamp(t + temporal_shift, 0.0, 1.0)
+
+        s1 = 0.13 * duration_scale
+        s2 = 0.16 * duration_scale
+        s3 = 0.14 * duration_scale
+
+        p1 = torch.exp(-0.5 * ((tt - 0.20) / s1) ** 2)
+        p2 = torch.exp(-0.5 * ((tt - 0.48) / s2) ** 2)
+        p3 = torch.exp(-0.5 * ((tt - 0.77) / s3) ** 2)
+        temporal = 0.58 * p1 + 1.00 * p2 + 0.78 * p3
+        temporal = temporal * (0.94 + 0.06 * torch.sin(2.0 * np.pi * (2.3 * tt + 0.10)))
+
+        broad1 = rot_gauss_torch(x, y, 0.45 + 0.02 * tt + shift_x, 0.56 + shift_y, 0.60, 0.44, -0.12 + band_rotation)
+        broad2 = rot_gauss_torch(x, y, 0.58 - 0.03 * tt + shift_x, 0.46 + 0.02 * tt + shift_y, 0.52, 0.36, -0.20 + band_rotation)
+        citywide = 0.64 + 0.70 * broad1 + 0.45 * broad2
+
+        shield1 = rot_gauss_torch(x, y, 0.34 + 0.12 * tt + shift_x, 0.74 - 0.06 * tt + shift_y, 0.34, 0.22, -0.52 + band_rotation)
+        shield2 = rot_gauss_torch(x, y, 0.58 - 0.05 * tt + shift_x, 0.52 + shift_y, 0.30, 0.24, -0.36 + band_rotation)
+        shield3 = rot_gauss_torch(x, y, 0.78 - 0.04 * tt + shift_x, 0.38 + 0.03 * tt + shift_y, 0.25, 0.20, -0.18 + band_rotation)
+        mesoscale = 0.80 * shield1 + 0.70 * shield2 + 0.45 * shield3
+
+        band1 = rot_gauss_torch(x, y, 0.22 + 0.18 * tt + shift_x, 0.78 - 0.12 * tt + shift_y, 0.46, 0.08, -0.84 + band_rotation)
+        band2 = rot_gauss_torch(x, y, 0.34 + 0.16 * tt + shift_x, 0.60 - 0.07 * tt + shift_y, 0.44, 0.08, -0.80 + band_rotation)
+        band3 = rot_gauss_torch(x, y, 0.48 + 0.12 * tt + shift_x, 0.44 + shift_y, 0.36, 0.075, -0.72 + band_rotation)
+        east_band = rot_gauss_torch(x, y, 0.84 - 0.03 * tt + shift_x, 0.52 + 0.04 * tt + shift_y, 0.18, 0.24, 0.12 + band_rotation)
+        bands = 0.82 * band1 + 0.72 * band2 + 0.58 * band3 + 0.34 * east_band
+
+        c1 = rot_gauss_torch(x, y, 0.18 + 0.20 * tt + shift_x, 0.83 - 0.14 * tt + shift_y, 0.065, 0.048, -0.28)
+        c2 = rot_gauss_torch(x, y, 0.32 + 0.18 * tt + shift_x, 0.68 - 0.11 * tt + shift_y, 0.058, 0.042, 0.10)
+        c3 = rot_gauss_torch(x, y, 0.48 + 0.10 * tt + shift_x, 0.57 - 0.05 * tt + shift_y, 0.055, 0.040, -0.18)
+        c4 = rot_gauss_torch(x, y, 0.62 - 0.05 * tt + shift_x, 0.45 + 0.02 * tt + shift_y, 0.056, 0.042, 0.32)
+        c5 = rot_gauss_torch(x, y, 0.73 - 0.08 * tt + shift_x, 0.32 + 0.05 * tt + shift_y, 0.064, 0.046, -0.16)
+        c6 = rot_gauss_torch(x, y, 0.86 - 0.02 * tt + shift_x, 0.55 + 0.01 * tt + shift_y, 0.050, 0.050, 0.12)
+        cells = 1.00 * c1 + 0.95 * c2 + 0.90 * c3 + 0.80 * c4 + 0.72 * c5 + 0.55 * c6
+
+        coast = rot_gauss_torch(x, y, 0.17 + 0.03 * tt + 0.4 * shift_x, 0.46 + shift_y, 0.16, 0.40, -0.06)
+        mithi_corridor = torch.exp(-((x - (0.50 + shift_x)) / 0.10) ** 2) * torch.exp(-((y - (0.42 + shift_y)) / 0.14) ** 2)
+        kurla_dharavi = torch.exp(-((x - (0.46 + shift_x)) / 0.09) ** 2) * torch.exp(-((y - (0.39 + shift_y)) / 0.09) ** 2)
+        thane_creek = torch.exp(-((x - (0.86 + shift_x)) / 0.11) ** 2) * torch.exp(-((y - (0.50 + shift_y)) / 0.14) ** 2)
+        corridor = 0.55 * mithi_corridor + 0.25 * kurla_dharavi + 0.20 * thane_creek
+
+        gradient = 0.94 + 0.05 * y + 0.03 * (1.0 - x)
+
+        spatial = (
+            citywide_amp * citywide +
+            shield_amp * 0.66 * mesoscale +
+            band_amp * 0.62 * bands +
+            cell_amp * 0.48 * cells +
+            coast_amp * 0.24 * coast +
+            corridor_amp * 0.24 * corridor
+        ) * gradient
+
+        return (peak_mmhr / 1000.0 / 3600.0) * temporal * spatial
+
+    return rainfall
+
+# ============================================================
+# OCEAN CONNECTIVITY
+# ============================================================
+def flood_fill_from_edges(candidate_mask, use_edges=("west", "south")):
+    h, w = candidate_mask.shape
+    out = np.zeros_like(candidate_mask, dtype=bool)
+    q = deque()
+
+    def push_if_valid(r, c):
+        if 0 <= r < h and 0 <= c < w and candidate_mask[r, c] and (not out[r, c]):
+            out[r, c] = True
+            q.append((r, c))
+
+    if "west" in use_edges:
+        for r in range(h):
+            push_if_valid(r, 0)
+    if "south" in use_edges:
+        for c in range(w):
+            push_if_valid(0, c)
+
+    if len(q) == 0:
+        for r in range(h):
+            push_if_valid(r, 0)
+            push_if_valid(r, w - 1)
+        for c in range(w):
+            push_if_valid(0, c)
+            push_if_valid(h - 1, c)
+
+    nbrs = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+    while q:
+        r, c = q.popleft()
+        for dr, dc in nbrs:
+            rr, cc = r + dr, c + dc
+            if 0 <= rr < h and 0 <= cc < w and candidate_mask[rr, cc] and (not out[rr, cc]):
+                out[rr, cc] = True
+                q.append((rr, cc))
+    return out
+
+# ============================================================
+# DEM + CORRECTED D8 HYDROLOGY
+# ============================================================
+def compute_d8_flow_accumulation(z, valid_mask, cell_x, cell_y):
+    h, w = z.shape
+    n = h * w
+
+    row_idx, col_idx = np.indices((h, w), dtype=np.int32)
+
+    best_slope = np.full((h, w), -np.inf, dtype=np.float32)
+    rec_r = -np.ones((h, w), dtype=np.int32)
+    rec_c = -np.ones((h, w), dtype=np.int32)
+
+    neighbors = [
+        (-1, -1, math.hypot(cell_x, cell_y)),
+        (-1, 0, cell_y),
+        (-1, 1, math.hypot(cell_x, cell_y)),
+        (0, -1, cell_x),
+        (0, 1, cell_x),
+        (1, -1, math.hypot(cell_x, cell_y)),
+        (1, 0, cell_y),
+        (1, 1, math.hypot(cell_x, cell_y)),
+    ]
+
+    z_work = z.copy()
+    z_work[~valid_mask] = np.inf
+
+    for dr, dc, dist in neighbors:
+        nb = shift_with_fill(z_work, dr, dc, np.inf)
+        nb_valid = shift_with_fill(valid_mask.astype(np.uint8), dr, dc, 0).astype(bool)
+
+        nr = row_idx - dr
+        nc = col_idx - dc
+        in_bounds = (nr >= 0) & (nr < h) & (nc >= 0) & (nc < w)
+
+        slope = (z_work - nb) / dist
+        better = valid_mask & nb_valid & in_bounds & (slope > best_slope) & (slope > 0.0)
+
+        best_slope[better] = slope[better]
+        rec_r[better] = nr[better]
+        rec_c[better] = nc[better]
+
+    rec_flat = -np.ones(n, dtype=np.int64)
+    valid_rec = valid_mask & (rec_r >= 0) & (rec_c >= 0)
+    rec_ids = rec_r[valid_rec].astype(np.int64) * w + rec_c[valid_rec].astype(np.int64)
+    rec_ids = np.where((rec_ids >= 0) & (rec_ids < n), rec_ids, -1)
+    flat_valid_idx = np.flatnonzero(valid_rec.ravel())
+    good = rec_ids >= 0
+    rec_flat[flat_valid_idx[good]] = rec_ids[good]
+
+    indeg = np.zeros(n, dtype=np.int32)
+    has_receiver = rec_flat >= 0
+    if np.any(has_receiver):
+        indeg += np.bincount(rec_flat[has_receiver], minlength=n)[:n].astype(np.int32)
+
+    acc = np.zeros(n, dtype=np.float32)
+    valid_flat = np.flatnonzero(valid_mask.ravel())
+    acc[valid_flat] = 1.0
+
+    q0 = valid_flat[indeg[valid_flat] == 0]
+    q = deque(q0.tolist())
+
+    while q:
+        i = q.popleft()
+        r = rec_flat[i]
+        if r >= 0:
+            acc[r] += acc[i]
+            indeg[r] -= 1
+            if indeg[r] == 0:
+                q.append(int(r))
+
+    acc = acc.reshape(h, w)
+    dirx = np.zeros((h, w), dtype=np.float32)
+    diry = np.zeros((h, w), dtype=np.float32)
+
+    dx = (rec_c.astype(np.float32) - col_idx.astype(np.float32)) * cell_x
+    dy = (rec_r.astype(np.float32) - row_idx.astype(np.float32)) * cell_y
+    mag = np.sqrt(dx * dx + dy * dy)
+
+    good_dir = valid_mask & (rec_r >= 0) & (rec_c >= 0) & (mag > 0)
+    dirx[good_dir] = dx[good_dir] / mag[good_dir]
+    diry[good_dir] = dy[good_dir] / mag[good_dir]
+
+    return rec_flat.reshape(h, w), acc, dirx, diry
+
+def delineate_watersheds(receivers, valid_mask, ocean_mask):
+    h, w = valid_mask.shape
+    n = h * w
+    rec = receivers.ravel().astype(np.int64)
+    valid = valid_mask.ravel()
+    ocean = ocean_mask.ravel()
+
+    root = np.full(n, -2, dtype=np.int64)
+    terminal = valid & ((rec < 0) | ocean)
+    terminal_ids = np.flatnonzero(terminal)
+    root[terminal_ids] = terminal_ids
+
+    valid_ids = np.flatnonzero(valid)
+    for i in valid_ids:
+        if root[i] != -2:
+            continue
+
+        path = []
+        j = i
+        while True:
+            if (j < 0) or (j >= n) or (not valid[j]):
+                r = -1
+                break
+            if root[j] != -2:
+                r = root[j]
+                break
+            path.append(j)
+            nxt = rec[j]
+            if (nxt < 0) or (nxt == j):
+                root[j] = j
+                r = j
+                break
+            j = nxt
+
+        for p in path:
+            root[p] = r
+
+    labels_flat = -np.ones(n, dtype=np.int32)
+    roots_valid = root[valid_ids]
+    unique_roots = np.unique(roots_valid[roots_valid >= 0])
+    root_to_label = {rid: k for k, rid in enumerate(unique_roots, start=1)}
+
+    for rid, lab in root_to_label.items():
+        labels_flat[root == rid] = lab
+
+    labels = labels_flat.reshape(h, w)
+
+    boundary = np.zeros((h, w), dtype=bool)
+    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+        nb = shift_with_fill(labels, dr, dc, -1)
+        boundary |= valid_mask & (labels > 0) & (nb > 0) & (labels != nb)
+
+    boundary &= (~ocean_mask)
+    return labels.astype(np.int32), boundary.astype(np.float32)
+
+def load_dem(path):
+    import rasterio
+
+    with rasterio.open(path) as src:
+        arr_raw = src.read(1).astype(np.float32)
+        bounds = src.bounds
+        nodata = src.nodata
+        transform = src.transform
+        crs = src.crs
+        h, w = arr_raw.shape
+
+    valid_mask = np.isfinite(arr_raw)
+    if nodata is not None:
+        valid_mask &= (arr_raw != nodata)
+
+    arr = arr_raw.copy()
+    arr[~valid_mask] = np.nan
+
+    arr_flip = np.flipud(arr)
+    valid_flip = np.flipud(valid_mask)
+
+    valid_vals = arr_flip[valid_flip]
+    fill_median = float(np.nanmedian(valid_vals)) if valid_vals.size else 0.0
+    arr_fill = arr_flip.copy()
+    arr_fill[~valid_flip] = fill_median
+
+    lon_min, lon_max = float(bounds.left), float(bounds.right)
+    lat_min, lat_max = float(bounds.bottom), float(bounds.top)
+    mid_lat = 0.5 * (lat_min + lat_max)
+    x_len = (lon_max - lon_min) * 111000.0 * np.cos(np.deg2rad(mid_lat))
+    y_len = (lat_max - lat_min) * 111000.0
+    cell_x = x_len / max(1, w - 1)
+    cell_y = y_len / max(1, h - 1)
+
+    xg = np.linspace(0.0, 1.0, w)
+    yg = np.linspace(0.0, 1.0, h)
+
+    elev_interp = RegularGridInterpolator((yg, xg), arr_fill, bounds_error=False, fill_value=fill_median)
+    valid_interp = RegularGridInterpolator((yg, xg), valid_flip.astype(np.float32), bounds_error=False, fill_value=0.0)
+
+    z_smooth = gaussian_filter(arr_fill, sigma=0.55)
+    dzdy, dzdx = np.gradient(z_smooth, cell_y, cell_x)
+    slope_mag = np.sqrt(dzdx * dzdx + dzdy * dzdy)
+
+    sx_interp = RegularGridInterpolator((yg, xg), dzdx.astype(np.float32), bounds_error=False, fill_value=0.0)
+    sy_interp = RegularGridInterpolator((yg, xg), dzdy.astype(np.float32), bounds_error=False, fill_value=0.0)
+
+    ocean_candidate = valid_flip & (arr_fill <= (SEA_LEVEL + SEA_ELEV_BUFFER))
+    ocean_mask = flood_fill_from_edges(ocean_candidate, use_edges=("west", "south"))
+
+    sea_base = np.zeros_like(arr_fill, dtype=np.float32)
+    sea_base[ocean_mask] = np.clip(SEA_LEVEL - arr_fill[ocean_mask], 0.0, SEA_BASE_MAX)
+
+    ocean_mask_interp = RegularGridInterpolator((yg, xg), ocean_mask.astype(np.float32), bounds_error=False, fill_value=0.0)
+    sea_base_interp = RegularGridInterpolator((yg, xg), sea_base.astype(np.float32), bounds_error=False, fill_value=0.0)
+
+    print("[HYDROLOGY] Computing corrected D8 flow directions and accumulation...")
+    receivers, acc, dirx, diry = compute_d8_flow_accumulation(arr_fill, valid_flip, cell_x, cell_y)
+
+    acc_valid = acc[valid_flip]
+    logacc = np.zeros_like(acc, dtype=np.float32)
+    logacc[valid_flip] = np.log1p(acc_valid)
+    logacc_max = max(float(np.nanmax(logacc[valid_flip])) if np.any(valid_flip) else 1.0, 1e-6)
+    acc_norm = np.zeros_like(acc, dtype=np.float32)
+    acc_norm[valid_flip] = logacc[valid_flip] / logacc_max
+
+    z1 = safe_percentile(arr_fill[valid_flip], 1, 0.0)
+    z99 = safe_percentile(arr_fill[valid_flip], 99, 1.0)
+    z_norm = np.clip((arr_fill - z1) / max(z99 - z1, 1e-6), 0, 1)
+    z_norm[~valid_flip] = 0.0
+
+    slope_p99 = safe_percentile(slope_mag[valid_flip], 99, 1.0)
+    slope_norm = np.clip(slope_mag / max(slope_p99, 1e-6), 0, 1)
+    slope_norm[~valid_flip] = 0.0
+
+    lowland = 1.0 - z_norm
+    lowland[~valid_flip] = 0.0
+
+    stream_thresh = safe_percentile(acc_valid, STREAM_ACCUM_PERCENTILE, 1.0)
+    stream_thresh_norm = np.log1p(stream_thresh) / logacc_max
+    channel_strength = np.zeros_like(acc_norm, dtype=np.float32)
+    channel_strength[valid_flip] = np.clip(
+        (acc_norm[valid_flip] - stream_thresh_norm) / max(1.0 - stream_thresh_norm, 1e-6),
+        0.0,
+        1.0,
+    )
+    stream_mask_native = valid_flip & (channel_strength > 0.05)
+
+    if np.any(stream_mask_native):
+        dist_to_channel = distance_transform_edt(~stream_mask_native, sampling=(cell_y, cell_x)).astype(np.float32)
+        decay_scale = max(3.0 * 0.5 * (cell_x + cell_y), 1.0)
+        channel_prox = np.exp(-dist_to_channel / decay_scale).astype(np.float32)
+    else:
+        channel_prox = np.zeros_like(acc_norm, dtype=np.float32)
+    channel_prox[~valid_flip] = 0.0
+
+    watershed_labels, watershed_boundary = delineate_watersheds(receivers, valid_flip, ocean_mask)
+
+    acc_interp = RegularGridInterpolator((yg, xg), acc_norm.astype(np.float32), bounds_error=False, fill_value=0.0)
+    lowland_interp = RegularGridInterpolator((yg, xg), lowland.astype(np.float32), bounds_error=False, fill_value=0.0)
+    dirx_interp = RegularGridInterpolator((yg, xg), dirx.astype(np.float32), bounds_error=False, fill_value=0.0)
+    diry_interp = RegularGridInterpolator((yg, xg), diry.astype(np.float32), bounds_error=False, fill_value=0.0)
+    channel_strength_interp = RegularGridInterpolator((yg, xg), channel_strength.astype(np.float32), bounds_error=False, fill_value=0.0)
+    channel_prox_interp = RegularGridInterpolator((yg, xg), channel_prox.astype(np.float32), bounds_error=False, fill_value=0.0)
+    watershed_boundary_interp = RegularGridInterpolator((yg, xg), watershed_boundary.astype(np.float32), bounds_error=False, fill_value=0.0)
+
+    terrain_tensor = make_multi_tensor(np.stack([
+        z_norm,
+        slope_norm,
+        acc_norm,
+        lowland,
+        dirx,
+        diry,
+        channel_strength,
+        channel_prox,
+    ], axis=0))
+
+    valid_tensor = make_field_tensor(valid_flip.astype(np.float32))
+    ocean_mask_tensor = make_field_tensor(ocean_mask.astype(np.float32))
+    sea_base_tensor = make_field_tensor(sea_base.astype(np.float32))
+    sx_tensor = make_field_tensor(dzdx.astype(np.float32))
+    sy_tensor = make_field_tensor(dzdy.astype(np.float32))
+    dirx_tensor = make_field_tensor(dirx.astype(np.float32))
+    diry_tensor = make_field_tensor(diry.astype(np.float32))
+
+    dem = {
+        "arr": arr_fill.astype(np.float32),
+        "valid_mask": valid_flip.astype(bool),
+        "ocean_mask": ocean_mask.astype(bool),
+        "sea_base": sea_base.astype(np.float32),
+        "h": h,
+        "w": w,
+        "lon_min": lon_min,
+        "lon_max": lon_max,
+        "lat_min": lat_min,
+        "lat_max": lat_max,
+        "x_len": x_len,
+        "y_len": y_len,
+        "cell_x": cell_x,
+        "cell_y": cell_y,
+        "transform": transform,
+        "crs": crs,
+        "src_nodata": nodata,
+        "elev_interp": elev_interp,
+        "valid_interp": valid_interp,
+        "ocean_mask_interp": ocean_mask_interp,
+        "sea_base_interp": sea_base_interp,
+        "sx_interp": sx_interp,
+        "sy_interp": sy_interp,
+        "acc": acc,
+        "acc_norm": acc_norm,
+        "acc_interp": acc_interp,
+        "lowland": lowland,
+        "lowland_interp": lowland_interp,
+        "dirx_interp": dirx_interp,
+        "diry_interp": diry_interp,
+        "channel_strength": channel_strength,
+        "channel_strength_interp": channel_strength_interp,
+        "channel_prox": channel_prox,
+        "channel_prox_interp": channel_prox_interp,
+        "watershed_labels": watershed_labels,
+        "watershed_boundary": watershed_boundary,
+        "watershed_boundary_interp": watershed_boundary_interp,
+        "stream_thresh_norm": float(stream_thresh_norm),
+        "stream_mask_native": stream_mask_native,
+        "receivers": receivers,
+        "terrain_tensor": terrain_tensor,
+        "valid_tensor": valid_tensor,
+        "ocean_mask_tensor": ocean_mask_tensor,
+        "sea_base_tensor": sea_base_tensor,
+        "sx_tensor": sx_tensor,
+        "sy_tensor": sy_tensor,
+        "dirx_tensor": dirx_tensor,
+        "diry_tensor": diry_tensor,
+    }
+
+    arr_valid = arr_fill[valid_flip]
+    print(f"[DEM] Size: {w} x {h}")
+    print(f"[DEM] Elevation range: {arr_valid.min():.2f} to {arr_valid.max():.2f} m")
+    print(f"[DOMAIN] X length: {x_len/1000:.2f} km | Y length: {y_len/1000:.2f} km")
+    print(f"[DEM] Approx cell size: {cell_x:.2f} m x {cell_y:.2f} m")
+    print(f"[SEA] Ocean-connected cells: {int(ocean_mask.sum())}")
+    print(f"[SEA] Max static sea depth used: {safe_percentile(sea_base[ocean_mask], 100, 0.0):.2f} m")
+    print(f"[STREAMS] Accumulation percentile threshold: {STREAM_ACCUM_PERCENTILE}")
+    print(f"[STREAMS] Native stream cells: {int(stream_mask_native.sum())}")
+    print(f"[WATERSHEDS] Delineated basins: {int(np.nanmax(watershed_labels))}")
+    print(f"[WATERSHEDS] Boundary cells: {int(watershed_boundary.sum())}")
+    return dem
+
+# ============================================================
+# HYDRAULIC TRAINING MESH
+# ============================================================
+def build_hydraulic_mesh(dem, mesh_m=HYDRAULIC_MESH_M):
+    nx_cells = max(8, int(np.ceil(dem["x_len"] / mesh_m)))
+    ny_cells = max(8, int(np.ceil(dem["y_len"] / mesh_m)))
+
+    x_centers = (np.arange(nx_cells, dtype=np.float32) + 0.5) / nx_cells
+    y_centers = (np.arange(ny_cells, dtype=np.float32) + 0.5) / ny_cells
+    xx, yy = np.meshgrid(x_centers, y_centers)
+    pts = np.stack([yy.ravel(), xx.ravel()], axis=-1)
+
+    valid = dem["valid_interp"](pts).reshape(ny_cells, nx_cells)
+    ocean = dem["ocean_mask_interp"](pts).reshape(ny_cells, nx_cells)
+    acc = dem["acc_interp"](pts).reshape(ny_cells, nx_cells)
+    lowland = dem["lowland_interp"](pts).reshape(ny_cells, nx_cells)
+    channel_strength = dem["channel_strength_interp"](pts).reshape(ny_cells, nx_cells)
+    channel_prox = dem["channel_prox_interp"](pts).reshape(ny_cells, nx_cells)
+
+    valid_mask = valid > 0.5
+    ocean_mask = ocean > 0.5
+    land_mask = valid_mask & (~ocean_mask)
+    channel_mask = land_mask & (channel_strength > 0.05)
+    floodplain_mask = land_mask & ((lowland > 0.55) | (channel_prox > 0.25))
+    upland_mask = land_mask & (~floodplain_mask)
+
+    hydro_score = np.zeros_like(acc, dtype=np.float32)
+    hydro_score[land_mask] = (
+        0.30 +
+        0.34 * acc[land_mask] +
+        0.24 * lowland[land_mask] +
+        0.12 * channel_strength[land_mask]
+    )
+    hydro_score = np.clip(hydro_score, 0.0, None)
+
+    flat_ids = np.arange(nx_cells * ny_cells, dtype=np.int64)
+    flat_land = flat_ids[land_mask.ravel()]
+    flat_ocean = flat_ids[(valid_mask & ocean_mask).ravel()]
+    flat_channel = flat_ids[channel_mask.ravel()]
+    flat_flood = flat_ids[floodplain_mask.ravel()]
+    flat_upland = flat_ids[upland_mask.ravel()]
+
+    def flat_from_mask(mask):
+        return flat_ids[mask.ravel()]
+
+    west_ids = flat_from_mask(land_mask & (np.arange(nx_cells)[None, :] == 0))
+    east_ids = flat_from_mask(land_mask & (np.arange(nx_cells)[None, :] == (nx_cells - 1)))
+    south_ids = flat_from_mask(land_mask & (np.arange(ny_cells)[:, None] == 0))
+    north_ids = flat_from_mask(land_mask & (np.arange(ny_cells)[:, None] == (ny_cells - 1)))
+
+    flat_acc = acc.ravel().astype(np.float32)
+    flat_lowland = lowland.ravel().astype(np.float32)
+    flat_channel_strength = channel_strength.ravel().astype(np.float32)
+    flat_hydro = hydro_score.ravel().astype(np.float32)
+
+    def weights_for(ids, base=0.05, use="hydro"):
+        if ids.size == 0:
+            return np.array([], dtype=np.float32)
+        if use == "hydro":
+            w = base + flat_hydro[ids]
+        elif use == "channel":
+            w = base + 0.60 * flat_channel_strength[ids] + 0.30 * flat_acc[ids] + 0.10 * flat_lowland[ids]
+        elif use == "flood":
+            w = base + 0.45 * flat_lowland[ids] + 0.35 * flat_acc[ids] + 0.20 * flat_channel_strength[ids]
+        elif use == "dry":
+            w = base + (1.0 - flat_acc[ids]) * 0.55 + (1.0 - flat_lowland[ids]) * 0.45
+        else:
+            w = np.ones(ids.shape[0], dtype=np.float32)
+        w = np.clip(w, 1e-6, None)
+        return w / w.sum()
+
+    mesh = {
+        "mesh_m": mesh_m,
+        "nx_cells": nx_cells,
+        "ny_cells": ny_cells,
+        "dx_norm": 1.0 / nx_cells,
+        "dy_norm": 1.0 / ny_cells,
+        "x_centers": x_centers,
+        "y_centers": y_centers,
+        "valid_mask": valid_mask,
+        "ocean_mask": ocean_mask,
+        "land_mask": land_mask,
+        "channel_mask": channel_mask,
+        "floodplain_mask": floodplain_mask,
+        "upland_mask": upland_mask,
+        "hydro_score": hydro_score,
+        "flat_land": flat_land,
+        "flat_ocean": flat_ocean,
+        "flat_channel": flat_channel,
+        "flat_flood": flat_flood,
+        "flat_upland": flat_upland,
+        "west_ids": west_ids,
+        "east_ids": east_ids,
+        "south_ids": south_ids,
+        "north_ids": north_ids,
+        "flat_acc": flat_acc,
+        "flat_lowland": flat_lowland,
+        "flat_channel_strength": flat_channel_strength,
+        "flat_hydro": flat_hydro,
+        "land_weights": weights_for(flat_land, use="hydro"),
+        "channel_weights": weights_for(flat_channel, use="channel"),
+        "flood_weights": weights_for(flat_flood, use="flood"),
+        "dry_weights": weights_for(flat_upland, use="dry"),
+        "ocean_weights": weights_for(flat_ocean, use="uniform"),
+    }
+
+    print(f"[MESH] Hydraulic training mesh: {nx_cells} x {ny_cells} cells")
+    print(f"[MESH] Nominal cell size: ~{dem['x_len']/nx_cells:.1f} m x {dem['y_len']/ny_cells:.1f} m")
+    print(f"[MESH] Land cells: {flat_land.size} | Channel cells: {flat_channel.size} | Floodplain cells: {flat_flood.size}")
+    return mesh
+
+def _sample_ids(ids, weights, n, fallback_ids, fallback_weights):
+    if ids.size == 0:
+        ids = fallback_ids
+        weights = fallback_weights
+    if ids.size == 0:
+        raise RuntimeError("No valid mesh cells available for sampling.")
+    if weights is None or weights.size == 0:
+        return np.random.choice(ids, size=n, replace=True)
+    return np.random.choice(ids, size=n, replace=True, p=weights)
+
+def _points_from_cell_ids(mesh, ids, side=None):
+    n = ids.shape[0]
+    ny = mesh["ny_cells"]
+    nx = mesh["nx_cells"]
+    rows = ids // nx
+    cols = ids % nx
+
+    if side is None:
+        tpl = POINT_TEMPLATES[np.random.randint(0, len(POINT_TEMPLATES), size=n)]
+        jx = np.random.normal(0.0, MESH_JITTER_FRAC, size=n).astype(np.float32)
+        jy = np.random.normal(0.0, MESH_JITTER_FRAC, size=n).astype(np.float32)
+        x = (cols.astype(np.float32) + 0.5 + tpl[:, 0] + jx) / nx
+        y = (rows.astype(np.float32) + 0.5 + tpl[:, 1] + jy) / ny
+    else:
+        if side == "west":
+            x = np.full(n, 1e-4, dtype=np.float32)
+            y = (rows.astype(np.float32) + np.random.rand(n).astype(np.float32)) / ny
+        elif side == "east":
+            x = np.full(n, 1.0 - 1e-4, dtype=np.float32)
+            y = (rows.astype(np.float32) + np.random.rand(n).astype(np.float32)) / ny
+        elif side == "south":
+            x = (cols.astype(np.float32) + np.random.rand(n).astype(np.float32)) / nx
+            y = np.full(n, 1e-4, dtype=np.float32)
+        else:
+            x = (cols.astype(np.float32) + np.random.rand(n).astype(np.float32)) / nx
+            y = np.full(n, 1.0 - 1e-4, dtype=np.float32)
+
+    x = np.clip(x, 0.0, 1.0)
+    y = np.clip(y, 0.0, 1.0)
+    return x.astype(np.float32), y.astype(np.float32)
+
+def sample_structured_pde_points(n, mesh):
+    n_ch = int(0.42 * n)
+    n_fp = int(0.28 * n)
+    n_ld = n - n_ch - n_fp
+
+    ids = np.concatenate([
+        _sample_ids(mesh["flat_channel"], mesh["channel_weights"], n_ch, mesh["flat_land"], mesh["land_weights"]),
+        _sample_ids(mesh["flat_flood"], mesh["flood_weights"], n_fp, mesh["flat_land"], mesh["land_weights"]),
+        _sample_ids(mesh["flat_land"], mesh["land_weights"], n_ld, mesh["flat_land"], mesh["land_weights"]),
+    ])
+    np.random.shuffle(ids)
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.random.rand(n).astype(np.float32)
+    w = (0.20 + 0.45 * mesh["flat_channel_strength"][ids] + 0.20 * mesh["flat_lowland"][ids] + 0.15 * mesh["flat_acc"][ids]).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t), np_to_torch(w)
+
+def sample_land_mesh(n, mesh):
+    ids = _sample_ids(mesh["flat_land"], mesh["land_weights"], n, mesh["flat_land"], mesh["land_weights"])
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.random.rand(n).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t), ids
+
+def sample_channel_mesh(n, mesh):
+    ids = _sample_ids(mesh["flat_channel"], mesh["channel_weights"], n, mesh["flat_land"], mesh["land_weights"])
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.random.rand(n).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t), ids
+
+def sample_floodplain_mesh(n, mesh):
+    ids = _sample_ids(mesh["flat_flood"], mesh["flood_weights"], n, mesh["flat_land"], mesh["land_weights"])
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.random.rand(n).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t), ids
+
+def sample_dry_mesh(n, mesh):
+    ids = _sample_ids(mesh["flat_upland"], mesh["dry_weights"], n, mesh["flat_land"], mesh["land_weights"])
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.random.rand(n).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t), ids
+
+def sample_ocean_mesh(n, mesh):
+    ids = _sample_ids(mesh["flat_ocean"], mesh["ocean_weights"], n, mesh["flat_land"], mesh["land_weights"])
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.random.rand(n).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t), ids
+
+def sample_ic(n, mesh):
+    ids = _sample_ids(mesh["flat_land"], mesh["land_weights"], n, mesh["flat_land"], mesh["land_weights"])
+    x, y = _points_from_cell_ids(mesh, ids)
+    t = np.zeros(n, dtype=np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t)
+
+def sample_boundary_side(side, n, mesh):
+    if side == "west":
+        ids = mesh["west_ids"]
+    elif side == "east":
+        ids = mesh["east_ids"]
+    elif side == "south":
+        ids = mesh["south_ids"]
+    else:
+        ids = mesh["north_ids"]
+
+    if ids.size == 0:
+        ids = mesh["flat_land"]
+
+    sampled = np.random.choice(ids, size=n, replace=True)
+    x, y = _points_from_cell_ids(mesh, sampled, side=side)
+    t = np.random.rand(n).astype(np.float32)
+    return np_to_torch(x), np_to_torch(y), np_to_torch(t)
+
+def sample_bc(n, mesh):
+    return {s: sample_boundary_side(s, n, mesh) for s in ("west", "east", "south", "north")}
+
+# ============================================================
+# RESAMPLED NUMPY GRIDS
+# ============================================================
+def get_resampled_from_interp(interp_fn, res):
+    xi = np.linspace(0.0, 1.0, res)
+    yi = np.linspace(0.0, 1.0, res)
+    xx, yy = np.meshgrid(xi, yi)
+    pts = np.stack([yy.ravel(), xx.ravel()], axis=-1)
+    return interp_fn(pts).reshape(res, res).astype(np.float32)
+
+def get_dem_grid(dem, res):
+    return get_resampled_from_interp(dem["elev_interp"], res)
+
+def get_valid_grid(dem, res):
+    return get_resampled_from_interp(dem["valid_interp"], res)
+
+def get_ocean_grid(dem, res):
+    return get_resampled_from_interp(dem["ocean_mask_interp"], res)
+
+def get_sea_base_grid(dem, res):
+    return get_resampled_from_interp(dem["sea_base_interp"], res)
+
+def get_stream_overlay(dem, res):
+    channel = get_resampled_from_interp(dem["channel_strength_interp"], res)
+    # Binary stream overlay derived from D8 flow accumulation / watershed-guided drainage
+    return (channel > 0.05).astype(np.float32)
+
+def get_watershed_boundary_overlay(dem, res):
+    return get_resampled_from_interp(dem["watershed_boundary_interp"], res)
+
+def get_dir_overlay(dem, res):
+    dirx = get_resampled_from_interp(dem["dirx_interp"], res)
+    diry = get_resampled_from_interp(dem["diry_interp"], res)
+    mag = np.sqrt(dirx ** 2 + diry ** 2)
+    good = mag > 1e-6
+    dirx[good] /= mag[good]
+    diry[good] /= mag[good]
+    return dirx, diry
+
+def make_hillshade(z, azdeg=315, altdeg=45, vert_exag=4.0):
+    z = np.asarray(z, dtype=np.float32)
+    z = np.nan_to_num(z, nan=np.nanmedian(z))
+    z = gaussian_filter(z, sigma=1.0) * vert_exag
+    dy, dx = np.gradient(z)
+    slope = np.pi / 2.0 - np.arctan(np.sqrt(dx * dx + dy * dy))
+    aspect = np.arctan2(-dx, dy)
+    az, alt = np.deg2rad(azdeg), np.deg2rad(altdeg)
+    hs = np.sin(alt) * np.sin(slope) + np.cos(alt) * np.cos(slope) * np.cos(az - aspect)
+    return np.clip(hs, 0, 1)
+
+def get_dem_overlay(dem, res, mode="hillshade"):
+    z = get_dem_grid(dem, res)
+    if mode == "elevation":
+        zmin, zmax = safe_percentile(z, 2, 0.0), safe_percentile(z, 98, 1.0)
+        return np.clip((z - zmin) / max(zmax - zmin, 1e-6), 0, 1) if zmax > zmin else np.zeros_like(z)
+    return make_hillshade(z, vert_exag=HILLSHADE_EXAG)
+
+# ============================================================
+# MODEL
+# ============================================================
+class FloodPINN(nn.Module):
+    def __init__(self, hidden=HIDDEN, layers=LAYERS, fourier=FOURIER, terrain_features=TERRAIN_FEATURES):
+        super().__init__()
+        self.register_buffer("B", torch.randn(3, fourier) * 2.0)
+
+        in_dim = 3 + 2 * fourier + terrain_features
+        mods = []
+        d = in_dim
+        for _ in range(layers):
+            mods.append(nn.Linear(d, hidden))
+            mods.append(nn.Tanh())
+            d = hidden
+        self.net = nn.Sequential(*mods)
+
+        self.head_h = nn.Linear(hidden, 1)
+        self.head_u = nn.Linear(hidden, 1)
+        self.head_v = nn.Linear(hidden, 1)
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+        with torch.no_grad():
+            self.head_h.bias.fill_(-5.2)
+
+    def forward(self, x, y, t, terrain):
+        c = torch.stack([x, y, t], dim=-1)
+        proj = c @ self.B
+        ff = torch.cat([torch.sin(2 * np.pi * proj), torch.cos(2 * np.pi * proj)], dim=-1)
+        z = self.net(torch.cat([c, ff, terrain], dim=-1))
+
+        h_dyn = F.softplus(self.head_h(z)).squeeze(-1)
+        u = 3.8 * torch.tanh(self.head_u(z)).squeeze(-1)
+        v = 3.8 * torch.tanh(self.head_v(z)).squeeze(-1)
+        return h_dyn, u, v
+
+def evaluate_model_total(model, dem, x, y, t):
+    terrain = get_terrain_features_torch(dem, x, y)
+    h_dyn, u, v = model(x, y, t, terrain)
+    sea_base = sample_field_torch(dem["sea_base_tensor"], x, y)
+    h_total = h_dyn + sea_base
+    return h_total, h_dyn, u, v, sea_base
+
+# ============================================================
+# PHYSICS RESIDUAL
+# ============================================================
+def grad(out, inp):
+    return torch.autograd.grad(
+        out,
+        inp,
+        grad_outputs=torch.ones_like(out),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+
+def physics_residual(model, dem, rainfall_fn, x, y, t):
+    x = x.clone().detach().requires_grad_(True)
+    y = y.clone().detach().requires_grad_(True)
+    t = t.clone().detach().requires_grad_(True)
+
+    h_total, h_dyn, u, v, sea_base = evaluate_model_total(model, dem, x, y, t)
+    qx = h_total * u
+    qy = h_total * v
+
+    dhdt = grad(h_total, t) / T_END_SECONDS
+    dqx_dx = grad(qx, x) / dem["x_len"]
+    dqy_dy = grad(qy, y) / dem["y_len"]
+
+    dqxu_dt = grad(qx, t) / T_END_SECONDS
+    dmx_dx = grad(h_total * u * u + 0.5 * G * h_total * h_total, x) / dem["x_len"]
+    dmx_dy = grad(h_total * u * v, y) / dem["y_len"]
+
+    dqyv_dt = grad(qy, t) / T_END_SECONDS
+    dmy_dx = grad(h_total * u * v, x) / dem["x_len"]
+    dmy_dy = grad(h_total * v * v + 0.5 * G * h_total * h_total, y) / dem["y_len"]
+
+    sx = sample_field_torch(dem["sx_tensor"], x, y)
+    sy = sample_field_torch(dem["sy_tensor"], x, y)
+    rain = rainfall_fn(x, y, t)
+
+    speed = torch.sqrt(u * u + v * v + 1e-8)
+    h_safe = torch.clamp(h_total, min=1e-3)
+    n2 = MANNING_N ** 2
+    tau_x = G * n2 * u * speed / (h_safe ** (1.0 / 3.0))
+    tau_y = G * n2 * v * speed / (h_safe ** (1.0 / 3.0))
+
+    rc = dhdt + dqx_dx + dqy_dy - rain
+    rx = dqxu_dt + dmx_dx + dmx_dy + G * h_total * sx + tau_x
+    ry = dqyv_dt + dmy_dx + dmy_dy + G * h_total * sy + tau_y
+    return rc, rx, ry
+
+# ============================================================
+# SYNTHETIC GUIDANCE / LOSSES
+# ============================================================
+def sample_obs(n, rainfall_fn, dem, mesh):
+    n_hot = int(0.44 * n)
+    n_fp = int(0.30 * n)
+    n_bg = max(1, n - n_hot - n_fp)
+
+    x1, y1, t1, _ = sample_channel_mesh(n_hot, mesh)
+    x2, y2, t2, _ = sample_floodplain_mesh(n_fp, mesh)
+    x3, y3, t3, _ = sample_land_mesh(n_bg, mesh)
+
+    x = torch.cat([x1, x2, x3], dim=0)
+    y = torch.cat([y1, y2, y3], dim=0)
+    t = torch.cat([t1, t2, t3], dim=0)
+
+    terrain = get_terrain_features_torch(dem, x, y)
+    z_norm = terrain[:, 0]
+    slope_norm = terrain[:, 1]
+    acc_w = terrain[:, 2]
+    low_w = terrain[:, 3]
+    ch_w = terrain[:, 6]
+    ch_p = terrain[:, 7]
+
+    rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+    base = 0.005 + 0.014 * low_w + 0.014 * acc_w + 0.012 * ch_w + 0.010 * ch_p
+    rain_term = 0.00155 * rain_mmhr * (0.45 + 0.20 * low_w + 0.20 * acc_w + 0.15 * ch_w)
+    terrain_term = 0.006 * (1.0 - slope_norm) + 0.004 * (1.0 - z_norm)
+    h_obs = torch.clamp(base + rain_term + terrain_term, 0.003, 3.0)
+    return x, y, t, h_obs
+
+def ic_loss(model, dem, mesh):
+    x, y, t = sample_ic(N_IC, mesh)
+    h_total, h_dyn, u, v, sea_base = evaluate_model_total(model, dem, x, y, t)
+    return (h_dyn ** 2).mean() + (u ** 2).mean() + (v ** 2).mean()
+
+def bc_loss(model, dem, mesh):
+    bc = sample_bc(N_BC, mesh)
+    loss = 0.0
+
+    for side in ["west", "south"]:
+        x, y, t = bc[side]
+        h_total, _, u, v, sea_base = evaluate_model_total(model, dem, x, y, t)
+        ow = sample_field_torch(dem["ocean_mask_tensor"], x, y).clamp(0, 1)
+        loss += (((h_total - sea_base) ** 2) * ow).mean()
+        if side == "west":
+            loss += ((u ** 2) * (1.0 - ow)).mean()
+        else:
+            loss += ((v ** 2) * (1.0 - ow)).mean()
+
+    x, y, t = bc["east"]
+    _, _, u, _, _ = evaluate_model_total(model, dem, x, y, t)
+    loss += (u ** 2).mean()
+
+    x, y, t = bc["north"]
+    _, _, _, v, _ = evaluate_model_total(model, dem, x, y, t)
+    loss += (v ** 2).mean()
+    return loss
+
+def data_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, h_obs = sample_obs(N_OBS, rainfall_fn, dem, mesh)
+    h_total, h_dyn, _, _, sea_base = evaluate_model_total(model, dem, x, y, t)
+    return ((h_total - sea_base - h_obs) ** 2).mean()
+
+def channel_guidance_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, _ = sample_channel_mesh(N_CH, mesh)
+    h_total, h_dyn, _, _, sea_base = evaluate_model_total(model, dem, x, y, t)
+    h_flood = h_total - sea_base
+    rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+    terrain = get_terrain_features_torch(dem, x, y)
+    z_norm, slope_norm, acc_w, low_w, _, _, ch_w, ch_p = [terrain[:, i] for i in range(8)]
+    target = (
+        0.006 + 0.020 * ch_w + 0.018 * ch_p + 0.010 * acc_w + 0.006 * low_w +
+        0.00125 * rain_mmhr * (0.50 + 0.25 * ch_w + 0.15 * ch_p + 0.10 * acc_w) +
+        0.003 * (1.0 - slope_norm) + 0.002 * (1.0 - z_norm)
+    )
+    return ((h_flood - target.clamp(0.004, 2.0)) ** 2).mean()
+
+def pluvial_spread_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, _ = sample_floodplain_mesh(N_PLUVIAL, mesh)
+    h_total, h_dyn, _, _, sea_base = evaluate_model_total(model, dem, x, y, t)
+    h_flood = h_total - sea_base
+    rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+    terrain = get_terrain_features_torch(dem, x, y)
+    z_norm, slope_norm, acc_w, low_w, _, _, ch_w, ch_p = [terrain[:, i] for i in range(8)]
+    target = (
+        0.004 + 0.012 * low_w + 0.008 * acc_w + 0.010 * ch_p +
+        0.00105 * rain_mmhr * (0.62 + 0.20 * low_w + 0.10 * ch_p + 0.08 * acc_w) +
+        0.002 * (1.0 - slope_norm) + 0.002 * (1.0 - z_norm)
+    )
+    weight = torch.clamp(rain_mmhr / 80.0, 0.2, 1.0)
+    return weighted_mean_torch((h_flood - target.clamp(0.003, 1.6)) ** 2, weight)
+
+def terrain_alignment_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, _ = sample_channel_mesh(N_ALIGN, mesh)
+    h_total, h_dyn, u, v, sea_base = evaluate_model_total(model, dem, x, y, t)
+    qx = h_total * u
+    qy = h_total * v
+    qmag = torch.sqrt(qx * qx + qy * qy + 1e-8)
+
+    dirx = sample_field_torch(dem["dirx_tensor"], x, y)
+    diry = sample_field_torch(dem["diry_tensor"], x, y)
+    terrain = get_terrain_features_torch(dem, x, y)
+    acc_w, low_w, slope_norm, ch_w, ch_p = terrain[:, 2], terrain[:, 3], terrain[:, 1], terrain[:, 6], terrain[:, 7]
+    rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+    rain_w = torch.clamp(rain_mmhr / 120.0, 0.0, 1.0)
+    dot = (qx / (qmag + 1e-6)) * dirx + (qy / (qmag + 1e-6)) * diry
+    hydro = 0.35 * ch_w + 0.25 * ch_p + 0.25 * acc_w + 0.15 * low_w
+    weight = hydro * (0.25 + 0.75 * rain_w) * torch.clamp(h_total / 0.20, 0.0, 1.0)
+    return weighted_mean_torch((1.0 - dot) ** 2, weight + 1e-6)
+
+def dry_suppression_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, _ = sample_dry_mesh(N_DRY, mesh)
+    h_total, h_dyn, _, _, sea_base = evaluate_model_total(model, dem, x, y, t)
+    h_flood = h_total - sea_base
+    terrain = get_terrain_features_torch(dem, x, y)
+    acc_w, low_w, slope_norm, ch_w = terrain[:, 2], terrain[:, 3], terrain[:, 1], terrain[:, 6]
+    rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+    rain_w = torch.clamp(rain_mmhr / 100.0, 0.0, 1.0)
+    dry_weight = (1.0 - acc_w) * (1.0 - low_w) * (1.0 - ch_w) * (1.0 - rain_w)
+    target = 0.001 + 0.002 * rain_w + 0.001 * (1.0 - slope_norm)
+    return weighted_mean_torch(((h_flood - target).clamp(min=0.0)) ** 2, dry_weight + 1e-6)
+
+def ocean_consistency_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, _ = sample_ocean_mesh(N_OCEAN, mesh)
+    h_total, h_dyn, u, v, sea_base = evaluate_model_total(model, dem, x, y, t)
+    ow = sample_field_torch(dem["ocean_mask_tensor"], x, y).clamp(0, 1)
+    loss_h = (((h_total - sea_base) ** 2) * ow).mean()
+    loss_uv = ((u * u + v * v) * ow).mean()
+    return loss_h + 0.10 * loss_uv
+
+def discharge_guidance_loss(model, rainfall_fn, dem, mesh):
+    x, y, t, _ = sample_channel_mesh(N_QGUIDE, mesh)
+    h_total, h_dyn, u, v, sea_base = evaluate_model_total(model, dem, x, y, t)
+    qmag = h_total * torch.sqrt(u * u + v * v + 1e-8)
+    terrain = get_terrain_features_torch(dem, x, y)
+    acc_w, low_w, ch_w, ch_p = terrain[:, 2], terrain[:, 3], terrain[:, 6], terrain[:, 7]
+    rain_mmhr = rainfall_fn(x, y, t) * 1000.0 * 3600.0
+    target = (
+        0.015 + 0.06 * ch_w + 0.05 * ch_p + 0.03 * acc_w +
+        0.0022 * rain_mmhr * (0.35 + 0.35 * ch_w + 0.20 * ch_p + 0.10 * acc_w)
+    )
+    w = 0.20 + 0.40 * ch_w + 0.25 * ch_p + 0.15 * acc_w
+    return weighted_mean_torch((qmag - target.clamp(0.01, 2.5)) ** 2, w)
+
+# ============================================================
+# TRAINING
+# ============================================================
+def train_model(model, dem, mesh, rainfall_fn, epochs):
+    optimizer = optim.AdamW(model.parameters(), lr=1.0e-3, weight_decay=1.0e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=2.0e-4)
+
+    history = {k: [] for k in (
+        "epoch", "total", "pde", "ic", "bc", "data",
+        "channel", "pluvial", "align", "dry", "ocean", "qguide", "lr"
+    )}
+
+    lam = {
+        "pde": 1.0,
+        "ic": 8.0,
+        "bc": 4.0,
+        "data": 16.0,
+        "channel": 3.8,
+        "pluvial": 4.6,
+        "align": 1.4,
+        "dry": 2.2,
+        "ocean": 12.0,
+        "qguide": 1.2,
+    }
+
+    print(f"[TRAIN] Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    for ep in range(epochs):
+        optimizer.zero_grad()
+
+        x, y, t, pde_w = sample_structured_pde_points(N_INT, mesh)
+        rc, rx, ry = physics_residual(model, dem, rainfall_fn, x, y, t)
+        lpde = (
+            weighted_mean_torch(rc ** 2, pde_w) +
+            weighted_mean_torch(rx ** 2, pde_w) +
+            weighted_mean_torch(ry ** 2, pde_w)
+        ) / 3.0
+
+        lic = ic_loss(model, dem, mesh)
+        lbc = bc_loss(model, dem, mesh)
+        ldata = data_loss(model, rainfall_fn, dem, mesh)
+        lch = channel_guidance_loss(model, rainfall_fn, dem, mesh)
+        lpluvial = pluvial_spread_loss(model, rainfall_fn, dem, mesh)
+        lalign = terrain_alignment_loss(model, rainfall_fn, dem, mesh)
+        ldry = dry_suppression_loss(model, rainfall_fn, dem, mesh)
+        locean = ocean_consistency_loss(model, rainfall_fn, dem, mesh)
+        lqguide = discharge_guidance_loss(model, rainfall_fn, dem, mesh)
+
+        loss = (
+            lam["pde"] * lpde +
+            lam["ic"] * lic +
+            lam["bc"] * lbc +
+            lam["data"] * ldata +
+            lam["channel"] * lch +
+            lam["pluvial"] * lpluvial +
+            lam["align"] * lalign +
+            lam["dry"] * ldry +
+            lam["ocean"] * locean +
+            lam["qguide"] * lqguide
+        )
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+
+        if ep % 25 == 0 or ep == epochs - 1:
+            lr = scheduler.get_last_lr()[0]
+            print(
+                f"ep {ep:04d} | total={loss.item():.3e} | pde={lpde.item():.3e} | "
+                f"ic={lic.item():.3e} | bc={lbc.item():.3e} | data={ldata.item():.3e} | "
+                f"channel={lch.item():.3e} | pluvial={lpluvial.item():.3e} | "
+                f"align={lalign.item():.3e} | dry={ldry.item():.3e} | ocean={locean.item():.3e} | "
+                f"qguide={lqguide.item():.3e} | lr={lr:.2e}"
+            )
+            for k, v in zip(
+                ("epoch", "total", "pde", "ic", "bc", "data", "channel", "pluvial", "align", "dry", "ocean", "qguide", "lr"),
+                (ep, loss.item(), lpde.item(), lic.item(), lbc.item(), ldata.item(), lch.item(), lpluvial.item(), lalign.item(), ldry.item(), locean.item(), lqguide.item(), lr)
+            ):
+                history[k].append(v)
+
+    return history
+
+# ============================================================
+# BATCHED PREDICTION
+# ============================================================
+@torch.no_grad()
+def predict_field(model, dem, t_norm, res, batch_size=PRED_BATCH_SIZE):
+    xi = np.linspace(0.0, 1.0, res)
+    yi = np.linspace(0.0, 1.0, res)
+    xx, yy = np.meshgrid(xi, yi)
+    x_all = xx.ravel().astype(np.float32)
+    y_all = yy.ravel().astype(np.float32)
+    n = x_all.size
+
+    H_dyn = np.empty(n, np.float32)
+    U = np.empty(n, np.float32)
+    V = np.empty(n, np.float32)
+
+    for i0 in range(0, n, batch_size):
+        i1 = min(i0 + batch_size, n)
+        xb = torch.from_numpy(x_all[i0:i1]).to(DEVICE)
+        yb = torch.from_numpy(y_all[i0:i1]).to(DEVICE)
+        tb = torch.full_like(xb, float(t_norm))
+        terrain = get_terrain_features_torch(dem, xb, yb)
+        h_dyn, u, v = model(xb, yb, tb, terrain)
+        H_dyn[i0:i1] = h_dyn.cpu().numpy()
+        U[i0:i1] = u.cpu().numpy()
+        V[i0:i1] = v.cpu().numpy()
+
+    H_dyn = H_dyn.reshape(res, res)
+    U = U.reshape(res, res)
+    V = V.reshape(res, res)
+
+    sea_base = get_sea_base_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    valid_res = get_valid_grid(dem, res)
+
+    H_total = H_dyn + sea_base
+    H_total[valid_res < 0.5] = np.nan
+
+    H_flood_land = H_dyn.copy()
+    H_flood_land[ocean_res >= 0.5] = np.nan
+    H_flood_land[valid_res < 0.5] = np.nan
+    H_flood_land[H_flood_land < 0] = 0.0
+
+    return xi, yi, H_total, H_flood_land, U, V, sea_base, ocean_res, valid_res
+
+@torch.no_grad()
+def predict_native_field(model, dem, t_norm, batch_size=PRED_BATCH_SIZE):
+    w, h = dem["w"], dem["h"]
+    xi = np.linspace(0.0, 1.0, w)
+    yi = np.linspace(0.0, 1.0, h)
+    xx, yy = np.meshgrid(xi, yi)
+    x_all = xx.ravel().astype(np.float32)
+    y_all = yy.ravel().astype(np.float32)
+    n = x_all.size
+
+    H_dyn = np.empty(n, np.float32)
+    U = np.empty(n, np.float32)
+    V = np.empty(n, np.float32)
+
+    for i0 in range(0, n, batch_size):
+        i1 = min(i0 + batch_size, n)
+        xb = torch.from_numpy(x_all[i0:i1]).to(DEVICE)
+        yb = torch.from_numpy(y_all[i0:i1]).to(DEVICE)
+        tb = torch.full_like(xb, float(t_norm))
+        terrain = get_terrain_features_torch(dem, xb, yb)
+        hd, u, v = model(xb, yb, tb, terrain)
+        H_dyn[i0:i1] = hd.cpu().numpy()
+        U[i0:i1] = u.cpu().numpy()
+        V[i0:i1] = v.cpu().numpy()
+
+    H_dyn = H_dyn.reshape(h, w)
+    U = U.reshape(h, w)
+    V = V.reshape(h, w)
+
+    H_total = H_dyn + dem["sea_base"]
+    H_total[~dem["valid_mask"]] = np.nan
+
+    H_flood_land = H_dyn.copy()
+    H_flood_land[dem["ocean_mask"]] = np.nan
+    H_flood_land[~dem["valid_mask"]] = np.nan
+    H_flood_land[H_flood_land < 0] = 0.0
+    return H_total, H_flood_land, U, V
+
+@torch.no_grad()
+def rainfall_grid(rainfall_fn, t_norm, res, batch_size=PRED_BATCH_SIZE):
+    xi = np.linspace(0.0, 1.0, res)
+    yi = np.linspace(0.0, 1.0, res)
+    xx, yy = np.meshgrid(xi, yi)
+    x_all = xx.ravel().astype(np.float32)
+    y_all = yy.ravel().astype(np.float32)
+    n = x_all.size
+    R = np.empty(n, np.float32)
+    for i0 in range(0, n, batch_size):
+        i1 = min(i0 + batch_size, n)
+        xb = torch.from_numpy(x_all[i0:i1]).to(DEVICE)
+        yb = torch.from_numpy(y_all[i0:i1]).to(DEVICE)
+        tb = torch.full_like(xb, float(t_norm))
+        R[i0:i1] = rainfall_fn(xb, yb, tb).cpu().numpy() * 1000.0 * 3600.0
+    return xi, yi, R.reshape(res, res)
+
+def blend_flow_for_display(U, V, H_flood_land, dirx_res, diry_res):
+    speed = np.sqrt(U ** 2 + V ** 2)
+    wet = np.isfinite(H_flood_land) & (H_flood_land > WET_DEPTH_THRESHOLD)
+    tb = np.clip(np.nan_to_num(H_flood_land, nan=0.0) / 0.18, 0.0, 1.0)
+    Ub = 0.55 * U + 0.45 * dirx_res * (0.50 + 0.90 * tb + 0.25 * speed)
+    Vb = 0.55 * V + 0.45 * diry_res * (0.50 + 0.90 * tb + 0.25 * speed)
+    Ub[~wet] = np.nan
+    Vb[~wet] = np.nan
+    return Ub, Vb
+
+def peak_speed_from_fields(flood_fields, u_fields, v_fields, ocean_res):
+    stk = []
+    for H, U, V in zip(flood_fields, u_fields, v_fields):
+        S = np.sqrt(U ** 2 + V ** 2)
+        S[~np.isfinite(H)] = np.nan
+        S[H <= WET_DEPTH_THRESHOLD] = np.nan
+        stk.append(np.where(np.isfinite(S), S, -np.inf))
+    peak = np.max(np.stack(stk, axis=0), axis=0)
+    peak[peak == -np.inf] = np.nan
+    peak[ocean_res >= 0.5] = np.nan
+    return peak
+
+def peak_discharge_from_fields(flood_fields, u_fields, v_fields, ocean_res):
+    stk = []
+    for H, U, V in zip(flood_fields, u_fields, v_fields):
+        Q = H * np.sqrt(U ** 2 + V ** 2)
+        Q[~np.isfinite(H)] = np.nan
+        Q[H <= WET_DEPTH_THRESHOLD] = np.nan
+        stk.append(np.where(np.isfinite(Q), Q, -np.inf))
+    peak = np.max(np.stack(stk, axis=0), axis=0)
+    peak[peak == -np.inf] = np.nan
+    peak[ocean_res >= 0.5] = np.nan
+    return peak
+
+def arrival_time_from_fields(flood_fields, tvals, ocean_res, threshold=ARRIVAL_DEPTH_THRESHOLD):
+    nt = len(flood_fields)
+    arr = np.full(flood_fields[0].shape, np.nan, dtype=np.float32)
+    for k in range(nt):
+        H = flood_fields[k]
+        hit = np.isnan(arr) & np.isfinite(H) & (H >= threshold)
+        arr[hit] = tvals[k] * T_END_SECONDS / 60.0
+    arr[ocean_res >= 0.5] = np.nan
+    return arr
+
+# ============================================================
+# PLOTTING HELPERS
+# ============================================================
+def ocean_rgba_image(ocean_res):
+    rgba = np.zeros((*ocean_res.shape, 4), dtype=np.float32)
+    m = ocean_res >= 0.5
+    rgba[m] = SEA_FILL_RGBA
+    return rgba
+
+def add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, contour_levels, xkm, ykm):
+    Xkm, Ykm = np.meshgrid(xkm, ykm)
+    if SHOW_SEA_FILL:
+        ax.imshow(ocean_rgba_image(ocean_res), extent=extent, origin="lower", aspect="equal")
+    if OVERLAY_DEM and dem_bg is not None:
+        ax.imshow(dem_bg, extent=extent, origin="lower", cmap="gray", alpha=DEM_OVERLAY_ALPHA, aspect="equal")
+    if SHOW_CONTOURS and contour_levels is not None:
+        ax.contour(Xkm, Ykm, dem_res, levels=contour_levels, colors="0.35", linewidths=CONTOUR_LW, alpha=CONTOUR_ALPHA)
+    if SHOW_STREAM_NETWORK and np.nanmax(stream_res) > 0.5:
+        ax.contour(Xkm, Ykm, stream_res, levels=[0.5], colors="navy", linewidths=STREAM_LW, alpha=STREAM_ALPHA)
+    if SHOW_WATERSHED_BOUNDARIES and np.nanmax(watershed_res) > 0.5:
+        ax.contour(Xkm, Ykm, watershed_res, levels=[0.5], colors=WATERSHED_COLOR, linewidths=WATERSHED_LW, alpha=WATERSHED_ALPHA)
+    if SHOW_DOMAIN_BOUNDARY and np.nanmin(valid_res) < 0.5 < np.nanmax(valid_res):
+        ax.contour(Xkm, Ykm, valid_res, levels=[0.5], colors="black", linewidths=BOUNDARY_LW, alpha=BOUNDARY_ALPHA)
+    if SHOW_COASTLINE and np.nanmin(ocean_res) < 0.5 < np.nanmax(ocean_res):
+        ax.contour(Xkm, Ykm, ocean_res, levels=[0.5], colors=COASTLINE_COLOR, linewidths=COASTLINE_LW, alpha=COASTLINE_ALPHA)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+
+def add_flow_overlay(ax, xkm, ykm, Ub, Vb, H_plot):
+    if not SHOW_VELOCITY:
+        return
+    wet = np.isfinite(H_plot) & (H_plot > WET_DEPTH_THRESHOLD)
+    if wet.sum() < 15:
+        return
+
+    if SHOW_STREAMLINES:
+        try:
+            Upl = np.ma.masked_where(~wet | ~np.isfinite(Ub), Ub)
+            Vpl = np.ma.masked_where(~wet | ~np.isfinite(Vb), Vb)
+            ax.streamplot(
+                xkm, ykm, Upl, Vpl,
+                density=STREAMLINE_DENSITY,
+                color="k",
+                linewidth=STREAMLINE_WIDTH,
+                arrowsize=0.85,
+                minlength=0.08,
+                maxlength=2.6,
+                broken_streamlines=True,
+                integration_direction="both",
+                zorder=8,
+            )
+        except Exception:
+            pass
+
+    s = VELOCITY_QUIVER_STEP
+    Xq, Yq = np.meshgrid(xkm[::s], ykm[::s])
+    Uq, Vq = Ub[::s, ::s], Vb[::s, ::s]
+    Hq = H_plot[::s, ::s]
+    wet_q = np.isfinite(Hq) & (Hq > WET_DEPTH_THRESHOLD)
+    if wet_q.any():
+        spd = np.sqrt(Uq ** 2 + Vq ** 2)
+        ax.quiver(
+            Xq[wet_q], Yq[wet_q],
+            Uq[wet_q] / (spd[wet_q] + 1e-6),
+            Vq[wet_q] / (spd[wet_q] + 1e-6),
+            color="k", alpha=VELOCITY_ALPHA, scale=VELOCITY_SCALE,
+            width=0.0018, headwidth=2.8, headlength=4.0, zorder=9,
+        )
+
+def plot_loss(history, save_path, title):
+    plt.figure(figsize=(13, 5.2))
+    for k in ("total", "pde", "ic", "bc", "data", "channel", "pluvial", "align", "dry", "ocean", "qguide"):
+        plt.semilogy(history["epoch"], history[k], label=k)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend(ncol=6, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=170)
+    plt.close()
+    print(f"[SAVED] {save_path}")
+
+def plot_hydraulic_context(dem, mesh, save_path, res=GRID_RES):
+    extent = get_plot_extent_km(dem)
+    panel_w, panel_h = get_panel_figsize(dem, base_h=6.0)
+    dem_res = get_dem_grid(dem, res)
+    dem_bg = get_dem_overlay(dem, res, mode=DEM_OVERLAY_MODE)
+    valid_res = get_valid_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    stream_res = get_stream_overlay(dem, res)
+    watershed_res = get_watershed_boundary_overlay(dem, res)
+    contour_lvls = compute_contour_levels(dem_res, n_levels=N_CONTOURS)
+    xkm = np.linspace(extent[0], extent[1], res)
+    ykm = np.linspace(extent[2], extent[3], res)
+
+    fig, ax = plt.subplots(figsize=(panel_w, panel_h), dpi=180)
+    add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, contour_lvls, xkm, ykm)
+
+    nx = mesh["nx_cells"]
+    ny = mesh["ny_cells"]
+    for j in range(0, nx + 1, max(1, nx // 20)):
+        x = j / nx * extent[1]
+        ax.plot([x, x], [0, extent[3]], color="white", alpha=0.12, lw=0.5)
+    for i in range(0, ny + 1, max(1, ny // 20)):
+        y = i / ny * extent[3]
+        ax.plot([0, extent[1]], [y, y], color="white", alpha=0.12, lw=0.5)
+
+    ax.set_title(f"Mumbai context | DEM + D8 watershed streams + watersheds | hydraulic mesh ~ {mesh['mesh_m']:.0f} m")
+    ax.set_xlabel("Easting (km)")
+    ax.set_ylabel("Northing (km)")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+    print(f"[SAVED] {save_path}")
+
+def plot_peak_depth_map(peak_H_land, dem, save_path, title):
+    H = peak_H_land.copy()
+    H[H < PEAK_MAP_WET_THRESHOLD] = np.nan
+    extent = get_plot_extent_km(dem)
+    panel_w, panel_h = get_panel_figsize(dem, base_h=6.0)
+    res = H.shape[0]
+    dem_res = get_dem_grid(dem, res)
+    dem_bg = get_dem_overlay(dem, res, mode=DEM_OVERLAY_MODE)
+    valid_res = get_valid_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    stream_res = get_stream_overlay(dem, res)
+    watershed_res = get_watershed_boundary_overlay(dem, res)
+    xkm = np.linspace(extent[0], extent[1], H.shape[1])
+    ykm = np.linspace(extent[2], extent[3], H.shape[0])
+    vmax = max(0.45, safe_percentile(H, 99, 0.45))
+
+    fig, ax = plt.subplots(figsize=(panel_w, panel_h), dpi=180)
+    add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, compute_contour_levels(dem_res, N_CONTOURS), xkm, ykm)
+    im = ax.imshow(H, extent=extent, origin="lower", cmap="turbo", vmin=0, vmax=vmax, alpha=0.86, aspect="equal")
+    ax.set_title(title)
+    ax.set_xlabel("Easting (km)")
+    ax.set_ylabel("Northing (km)")
+    plt.colorbar(im, ax=ax, label="Peak land inundation depth (m)")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+    print(f"[SAVED] {save_path}")
+
+def plot_peak_speed_map(peak_speed_land, dem, save_path, title):
+    S = peak_speed_land.copy()
+    S[S < 0.05] = np.nan
+    extent = get_plot_extent_km(dem)
+    panel_w, panel_h = get_panel_figsize(dem, base_h=6.0)
+    res = S.shape[0]
+    dem_res = get_dem_grid(dem, res)
+    dem_bg = get_dem_overlay(dem, res, mode=DEM_OVERLAY_MODE)
+    valid_res = get_valid_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    stream_res = get_stream_overlay(dem, res)
+    watershed_res = get_watershed_boundary_overlay(dem, res)
+    xkm = np.linspace(extent[0], extent[1], S.shape[1])
+    ykm = np.linspace(extent[2], extent[3], S.shape[0])
+    vmax = max(0.40, safe_percentile(S, 99, 0.40))
+
+    fig, ax = plt.subplots(figsize=(panel_w, panel_h), dpi=180)
+    add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, compute_contour_levels(dem_res, N_CONTOURS), xkm, ykm)
+    im = ax.imshow(S, extent=extent, origin="lower", cmap="plasma", vmin=0, vmax=vmax, alpha=0.84, aspect="equal")
+    ax.set_title(title)
+    ax.set_xlabel("Easting (km)")
+    ax.set_ylabel("Northing (km)")
+    plt.colorbar(im, ax=ax, label="Peak land flood speed (m/s)")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+    print(f"[SAVED] {save_path}")
+
+def plot_peak_discharge_map(peak_q_land, dem, save_path, title):
+    Q = peak_q_land.copy()
+    Q[Q < 0.02] = np.nan
+    extent = get_plot_extent_km(dem)
+    panel_w, panel_h = get_panel_figsize(dem, base_h=6.0)
+    res = Q.shape[0]
+    dem_res = get_dem_grid(dem, res)
+    dem_bg = get_dem_overlay(dem, res, mode=DEM_OVERLAY_MODE)
+    valid_res = get_valid_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    stream_res = get_stream_overlay(dem, res)
+    watershed_res = get_watershed_boundary_overlay(dem, res)
+    xkm = np.linspace(extent[0], extent[1], Q.shape[1])
+    ykm = np.linspace(extent[2], extent[3], Q.shape[0])
+    vmax = max(0.15, safe_percentile(Q, 99, 0.15))
+
+    fig, ax = plt.subplots(figsize=(panel_w, panel_h), dpi=180)
+    add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, compute_contour_levels(dem_res, N_CONTOURS), xkm, ykm)
+    im = ax.imshow(Q, extent=extent, origin="lower", cmap="inferno", vmin=0, vmax=vmax, alpha=0.84, aspect="equal")
+    ax.set_title(title)
+    ax.set_xlabel("Easting (km)")
+    ax.set_ylabel("Northing (km)")
+    plt.colorbar(im, ax=ax, label="Peak unit discharge proxy (m²/s)")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+    print(f"[SAVED] {save_path}")
+
+def plot_arrival_time_map(arrival_min, dem, save_path, title):
+    A = arrival_min.copy()
+    extent = get_plot_extent_km(dem)
+    panel_w, panel_h = get_panel_figsize(dem, base_h=6.0)
+    res = A.shape[0]
+    dem_res = get_dem_grid(dem, res)
+    dem_bg = get_dem_overlay(dem, res, mode=DEM_OVERLAY_MODE)
+    valid_res = get_valid_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    stream_res = get_stream_overlay(dem, res)
+    watershed_res = get_watershed_boundary_overlay(dem, res)
+    xkm = np.linspace(extent[0], extent[1], A.shape[1])
+    ykm = np.linspace(extent[2], extent[3], A.shape[0])
+    vmax = safe_percentile(A, 98, T_END_SECONDS / 60.0) if np.isfinite(A).any() else (T_END_SECONDS / 60.0)
+
+    fig, ax = plt.subplots(figsize=(panel_w, panel_h), dpi=180)
+    add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, compute_contour_levels(dem_res, N_CONTOURS), xkm, ykm)
+    im = ax.imshow(A, extent=extent, origin="lower", cmap="viridis_r", vmin=0, vmax=vmax, alpha=0.84, aspect="equal")
+    ax.set_title(title)
+    ax.set_xlabel("Easting (km)")
+    ax.set_ylabel("Northing (km)")
+    plt.colorbar(im, ax=ax, label=f"Arrival time to {ARRIVAL_DEPTH_THRESHOLD:.2f} m (min)")
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=180)
+    plt.close(fig)
+    print(f"[SAVED] {save_path}")
+
+def plot_summary_bar(summary_rows, save_path):
+    names = [r["case"] for r in summary_rows]
+    peak_rain = [r["peak_rain_mmhr"] for r in summary_rows]
+    peak_depth = [r["peak_depth_m"] for r in summary_rows]
+    x = np.arange(len(names))
+    w = 0.38
+    fig, ax1 = plt.subplots(figsize=(12.5, 5.4))
+    ax1.bar(x - w / 2, peak_rain, width=w, label="Peak rainfall (mm/hr)")
+    ax1.set_ylabel("Peak rainfall (mm/hr)")
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(names, rotation=18, ha="right")
+    ax2 = ax1.twinx()
+    ax2.bar(x + w / 2, peak_depth, width=w, label="Peak land inundation depth (m)")
+    ax2.set_ylabel("Peak land inundation depth (m)")
+    ax1.set_title("Scenario comparison")
+    ax1.grid(True, axis="y", alpha=0.25)
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper left")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=170)
+    plt.close()
+    print(f"[SAVED] {save_path}")
+
+# ============================================================
+# NUMERIC EXPORTS
+# ============================================================
+def save_geotiff(array_southup, dem, save_path, nodata=-9999.0, dtype="float32"):
+    import rasterio
+
+    arr = np.flipud(array_southup.astype(np.float32))
+    arr_out = np.where(np.isfinite(arr), arr, nodata).astype(np.float32)
+    with rasterio.open(
+        save_path,
+        "w",
+        driver="GTiff",
+        height=arr_out.shape[0],
+        width=arr_out.shape[1],
+        count=1,
+        dtype=dtype,
+        crs=dem["crs"],
+        transform=dem["transform"],
+        nodata=nodata,
+        compress="lzw",
+    ) as dst:
+        dst.write(arr_out, 1)
+    print(f"[SAVED] {save_path}")
+
+def save_coarse_numeric_csv(peak_depth, peak_speed, peak_q, arrival_min, dem, save_path, res=NUMERIC_CSV_RES):
+    extent = get_plot_extent_km(dem)
+    xkm = np.linspace(extent[0], extent[1], res)
+    ykm = np.linspace(extent[2], extent[3], res)
+    ocean = get_ocean_grid(dem, res)
+    valid = get_valid_grid(dem, res)
+
+    with open(save_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["x_km", "y_km", "peak_land_depth_m", "peak_speed_mps", "peak_unit_discharge_m2ps", "arrival_min", "is_ocean", "is_valid"])
+        for i, yv in enumerate(ykm):
+            for j, xv in enumerate(xkm):
+                d = peak_depth[i, j]
+                s = peak_speed[i, j]
+                q = peak_q[i, j]
+                a = arrival_min[i, j]
+                writer.writerow([
+                    float(xv),
+                    float(yv),
+                    "" if not np.isfinite(d) else float(d),
+                    "" if not np.isfinite(s) else float(s),
+                    "" if not np.isfinite(q) else float(q),
+                    "" if not np.isfinite(a) else float(a),
+                    int(ocean[i, j] >= 0.5),
+                    int(valid[i, j] >= 0.5),
+                ])
+    print(f"[SAVED] {save_path}")
+
+def save_numeric_outputs(case_dir, slug, dem, peak_H_land, peak_speed_land, peak_q_land, arrival_min,
+                         rain_cube=None, depth_cube=None, speed_cube=None, q_cube=None, time_values=None):
+    if EXPORT_NATIVE_PEAK_TIFFS:
+        save_geotiff(peak_H_land, dem, os.path.join(case_dir, f"{slug}_peak_land_depth_native.tif"))
+        save_geotiff(peak_speed_land, dem, os.path.join(case_dir, f"{slug}_peak_land_speed_native.tif"))
+        save_geotiff(peak_q_land, dem, os.path.join(case_dir, f"{slug}_peak_land_discharge_native.tif"))
+        save_geotiff(arrival_min, dem, os.path.join(case_dir, f"{slug}_arrival_time_native.tif"))
+        if EXPORT_NATIVE_OCEAN_MASK:
+            save_geotiff(dem["ocean_mask"].astype(np.float32), dem, os.path.join(case_dir, f"{slug}_ocean_mask_native.tif"), nodata=-9999.0)
+
+    if EXPORT_COARSE_NUMERIC_CSV:
+        save_coarse_numeric_csv(
+            peak_H_land, peak_speed_land, peak_q_land, arrival_min, dem,
+            os.path.join(case_dir, f"{slug}_peak_numeric_grid.csv"),
+            res=min(NUMERIC_CSV_RES, peak_H_land.shape[0]),
+        )
+
+    if EXPORT_NUMPY_CUBES:
+        np.savez_compressed(
+            os.path.join(case_dir, f"{slug}_peak_numeric_arrays.npz"),
+            peak_land_depth_m=peak_H_land.astype(np.float32),
+            peak_speed_mps=peak_speed_land.astype(np.float32),
+            peak_unit_discharge_m2ps=peak_q_land.astype(np.float32),
+            arrival_min=arrival_min.astype(np.float32),
+            ocean_mask=dem["ocean_mask"].astype(np.uint8),
+            valid_mask=dem["valid_mask"].astype(np.uint8),
+            x_len_m=np.array([dem["x_len"]], dtype=np.float32),
+            y_len_m=np.array([dem["y_len"]], dtype=np.float32),
+        )
+        print(f"[SAVED] {os.path.join(case_dir, f'{slug}_peak_numeric_arrays.npz')}")
+
+        if rain_cube is not None and depth_cube is not None and speed_cube is not None and q_cube is not None and time_values is not None:
+            np.savez_compressed(
+                os.path.join(case_dir, f"{slug}_time_cubes_resampled.npz"),
+                time_norm=np.asarray(time_values, dtype=np.float32),
+                rainfall_mmhr=rain_cube.astype(np.float32),
+                land_depth_m=depth_cube.astype(np.float32),
+                speed_mps=speed_cube.astype(np.float32),
+                unit_discharge_m2ps=q_cube.astype(np.float32),
+            )
+            print(f"[SAVED] {os.path.join(case_dir, f'{slug}_time_cubes_resampled.npz')}")
+
+# ============================================================
+# GIF MAKER + NATIVE PEAK ANALYSIS
+# ============================================================
+def make_single_panel_gif(frames_data, dem, out_path, title_prefix, kind="depth", gif_fps=GIF_FPS):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    extent = get_plot_extent_km(dem)
+    res = frames_data[0]["field"].shape[0]
+    xkm = np.linspace(extent[0], extent[1], res)
+    ykm = np.linspace(extent[2], extent[3], res)
+
+    dem_res = get_dem_grid(dem, res)
+    dem_bg = get_dem_overlay(dem, res, mode=DEM_OVERLAY_MODE) if OVERLAY_DEM else None
+    valid_res = get_valid_grid(dem, res)
+    ocean_res = get_ocean_grid(dem, res)
+    stream_res = get_stream_overlay(dem, res)
+    watershed_res = get_watershed_boundary_overlay(dem, res)
+    contour_lvls = compute_contour_levels(dem_res, n_levels=N_CONTOURS)
+
+    vals = []
+    for fr in frames_data:
+        fld = fr["field"]
+        good = fld[np.isfinite(fld)]
+        if good.size:
+            vals.append(good)
+    vmax = max(0.1, safe_percentile(np.concatenate(vals) if vals else np.array([0.1], dtype=np.float32), 99, 0.1))
+
+    if kind == "rain":
+        cmap = "Blues"
+        cbar_label = "Rainfall (mm/hr)"
+    elif kind == "depth":
+        cmap = "turbo"
+        cbar_label = "Land inundation depth (m)"
+    elif kind == "speed":
+        cmap = "plasma"
+        cbar_label = "Flow speed (m/s)"
+    else:
+        cmap = "inferno"
+        cbar_label = "Unit discharge proxy (m²/s)"
+
+    panel_w, panel_h = get_panel_figsize(dem, base_h=5.3)
+    frames = []
+
+    for fr in frames_data:
+        field = fr["field"].copy()
+        sim_min = fr["t_norm"] * T_END_SECONDS / 60.0
+        H_plot = fr.get("depth_for_flow", None)
+        Ub = fr.get("Ub", None)
+        Vb = fr.get("Vb", None)
+
+        fig, ax = plt.subplots(figsize=(panel_w, panel_h), dpi=130)
+        add_context_layers(ax, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, contour_lvls, xkm, ykm)
+        im = ax.imshow(field, extent=extent, origin="lower", cmap=cmap, vmin=0, vmax=vmax, alpha=0.86, aspect="equal")
+
+        if kind in ("depth", "speed", "discharge") and H_plot is not None and Ub is not None and Vb is not None:
+            add_flow_overlay(ax, xkm, ykm, Ub, Vb, H_plot)
+
+        ax.set_title(f"{title_prefix}\nTime = {sim_min:.1f} min")
+        ax.set_xlabel("Easting (km)")
+        ax.set_ylabel("Northing (km)")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.03).set_label(cbar_label)
+        fig.tight_layout()
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130)
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(Image.open(buf).convert("P", palette=Image.ADAPTIVE).copy())
+
+    frames[0].save(out_path, save_all=True, append_images=frames[1:], duration=int(1000 / gif_fps), loop=0, optimize=True)
+    print(f"[SAVED] {out_path}")
+
+def make_hydraulic_gif(model, dem, rainfall_fn, out_path, grid_res=GRID_RES, gif_frames=GIF_FRAMES, gif_fps=GIF_FPS):
+    model.eval()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+    print(f"[GIF] Building {gif_frames} frames...")
+    tvals = np.linspace(0.0, 1.0, gif_frames)
+
+    extent = get_plot_extent_km(dem)
+    xkm = np.linspace(extent[0], extent[1], grid_res)
+    ykm = np.linspace(extent[2], extent[3], grid_res)
+
+    dem_res = get_dem_grid(dem, grid_res)
+    dem_bg = get_dem_overlay(dem, grid_res, mode=DEM_OVERLAY_MODE) if OVERLAY_DEM else None
+    valid_res = get_valid_grid(dem, grid_res)
+    ocean_res = get_ocean_grid(dem, grid_res)
+    stream_res = get_stream_overlay(dem, grid_res)
+    watershed_res = get_watershed_boundary_overlay(dem, grid_res)
+    dirx_res, diry_res = get_dir_overlay(dem, grid_res)
+    contour_lvls = compute_contour_levels(dem_res, n_levels=N_CONTOURS)
+
+    rain_fields = []
+    flood_fields = []
+    u_fields = []
+    v_fields = []
+    speed_fields = []
+    q_fields = []
+
+    rain_max = 20.0
+    depth_max = 0.5
+    speed_max = 0.5
+    q_max = 0.1
+
+    for tn in tvals:
+        _, _, R = rainfall_grid(rainfall_fn, tn, grid_res)
+        _, _, _, H_fl, U, V, _, _, _ = predict_field(model, dem, tn, grid_res)
+        S = np.sqrt(U ** 2 + V ** 2)
+        Q = H_fl * S
+        Q[~np.isfinite(H_fl)] = np.nan
+
+        rain_fields.append(R)
+        flood_fields.append(H_fl)
+        u_fields.append(U)
+        v_fields.append(V)
+        speed_fields.append(S)
+        q_fields.append(Q)
+
+        if np.isfinite(R).any():
+            rain_max = max(rain_max, safe_percentile(R, 99, 20.0))
+        if np.isfinite(H_fl).any():
+            depth_max = max(depth_max, safe_percentile(H_fl, 99, 0.5))
+        if np.isfinite(S).any():
+            speed_max = max(speed_max, safe_percentile(S, 99, 0.5))
+        if np.isfinite(Q).any():
+            q_max = max(q_max, safe_percentile(Q, 99, 0.1))
+
+    print(f"[GIF] Rain max={rain_max:.1f} mm/hr | Depth max={depth_max:.2f} m | Speed max={speed_max:.2f} m/s | Q max={q_max:.2f} m²/s")
+
+    depth_stk = np.stack([np.where(np.isfinite(H), H, -np.inf) for H in flood_fields], axis=0)
+    peak_H_land = np.max(depth_stk, axis=0)
+    peak_H_land[peak_H_land == -np.inf] = np.nan
+    peak_H_land[ocean_res >= 0.5] = np.nan
+    peak_speed_land = peak_speed_from_fields(flood_fields, u_fields, v_fields, ocean_res)
+    peak_q_land = peak_discharge_from_fields(flood_fields, u_fields, v_fields, ocean_res)
+    arrival_min = arrival_time_from_fields(flood_fields, tvals, ocean_res, threshold=ARRIVAL_DEPTH_THRESHOLD)
+
+    frames = []
+    rain_only_frames = []
+    depth_only_frames = []
+    speed_only_frames = []
+    discharge_only_frames = []
+
+    panel_w, panel_h = get_panel_figsize(dem, base_h=5.0)
+    fig_w = 3.0 * panel_w + 2.8
+    fig_h = panel_h + 0.9
+
+    for i, tn in enumerate(tvals):
+        R = rain_fields[i]
+        H_land = flood_fields[i]
+        U = u_fields[i]
+        V = v_fields[i]
+        S = speed_fields[i]
+        Q = q_fields[i]
+
+        H_plot = H_land.copy()
+        H_plot[H_plot < WET_DEPTH_THRESHOLD] = np.nan
+        Ub, Vb = blend_flow_for_display(U, V, H_plot, dirx_res, diry_res)
+        sim_min = (tn * T_END_SECONDS) / 60.0
+
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(fig_w, fig_h), dpi=120)
+
+        add_context_layers(ax1, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, contour_lvls, xkm, ykm)
+        im1 = ax1.imshow(R, extent=extent, origin="lower", cmap="Blues", vmin=0, vmax=rain_max, alpha=0.82 if dem_bg is not None else 1.0, aspect="equal")
+        ax1.set_title(f"Spatial Rainfall + D8 Watershed Streams\nTime = {sim_min:.1f} min")
+        ax1.set_xlabel("Easting (km)")
+        ax1.set_ylabel("Northing (km)")
+        fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.03).set_label("Rainfall (mm/hr)")
+
+        add_context_layers(ax2, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, contour_lvls, xkm, ykm)
+        im2 = ax2.imshow(H_plot, extent=extent, origin="lower", cmap="turbo", vmin=0, vmax=depth_max, alpha=0.86, aspect="equal")
+        add_flow_overlay(ax2, xkm, ykm, Ub, Vb, H_plot)
+        ax2.set_title(f"Land Flood Depth + D8 Watershed Streams\nTime = {sim_min:.1f} min")
+        ax2.set_xlabel("Easting (km)")
+        ax2.set_ylabel("Northing (km)")
+        fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.03).set_label("Land inundation depth (m)")
+
+        add_context_layers(ax3, dem_bg, dem_res, valid_res, ocean_res, stream_res, watershed_res, extent, contour_lvls, xkm, ykm)
+        q_plot = Q.copy()
+        q_plot[H_plot <= WET_DEPTH_THRESHOLD] = np.nan
+        im3 = ax3.imshow(q_plot, extent=extent, origin="lower", cmap="inferno", vmin=0, vmax=q_max, alpha=0.84, aspect="equal")
+        add_flow_overlay(ax3, xkm, ykm, Ub, Vb, H_plot)
+        ax3.set_title(f"Discharge Intensity + D8 Watershed Streams\nTime = {sim_min:.1f} min")
+        ax3.set_xlabel("Easting (km)")
+        ax3.set_ylabel("Northing (km)")
+        fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.03).set_label("Unit discharge proxy (m²/s)")
+
+        fig.suptitle(f"Mumbai structured-grid hydraulic PINN | Frame {i + 1}/{gif_frames}", fontsize=14, fontweight="bold")
+        fig.subplots_adjust(left=0.045, right=0.985, bottom=0.10, top=0.88, wspace=0.16)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120)
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(Image.open(buf).convert("P", palette=Image.ADAPTIVE).copy())
+
+        rain_only_frames.append({
+            "field": R.copy(),
+            "t_norm": float(tn),
+        })
+        depth_only_frames.append({
+            "field": H_plot.copy(),
+            "t_norm": float(tn),
+            "depth_for_flow": H_plot.copy(),
+            "Ub": Ub.copy(),
+            "Vb": Vb.copy(),
+        })
+        speed_plot = S.copy()
+        speed_plot[~np.isfinite(H_plot)] = np.nan
+        speed_plot[H_plot <= WET_DEPTH_THRESHOLD] = np.nan
+        speed_only_frames.append({
+            "field": speed_plot,
+            "t_norm": float(tn),
+            "depth_for_flow": H_plot.copy(),
+            "Ub": Ub.copy(),
+            "Vb": Vb.copy(),
+        })
+        discharge_only_frames.append({
+            "field": q_plot.copy(),
+            "t_norm": float(tn),
+            "depth_for_flow": H_plot.copy(),
+            "Ub": Ub.copy(),
+            "Vb": Vb.copy(),
+        })
+
+    frames[0].save(out_path, save_all=True, append_images=frames[1:], duration=int(1000 / gif_fps), loop=0, optimize=True)
+    print(f"[SAVED] {out_path}")
+
+    base_dir = os.path.dirname(out_path)
+    base_name = os.path.splitext(os.path.basename(out_path))[0]
+    rain_gif_path = os.path.join(base_dir, f"{base_name}_rainfall_only.gif")
+    depth_gif_path = os.path.join(base_dir, f"{base_name}_inundation_only.gif")
+    speed_gif_path = os.path.join(base_dir, f"{base_name}_flow_speed_only.gif")
+    discharge_gif_path = os.path.join(base_dir, f"{base_name}_discharge_only.gif")
+
+    make_single_panel_gif(rain_only_frames, dem, rain_gif_path, "Spatial Rainfall", kind="rain", gif_fps=gif_fps)
+    make_single_panel_gif(depth_only_frames, dem, depth_gif_path, "Land Inundation + Flow", kind="depth", gif_fps=gif_fps)
+    make_single_panel_gif(speed_only_frames, dem, speed_gif_path, "Flow Speed + Direction", kind="speed", gif_fps=gif_fps)
+    make_single_panel_gif(discharge_only_frames, dem, discharge_gif_path, "Discharge Intensity + Streamlines", kind="discharge", gif_fps=gif_fps)
+
+    print(f"[NATIVE] Computing native peak fields over {NATIVE_ANALYSIS_FRAMES} time slices...")
+    tvals_native = np.linspace(0.0, 1.0, NATIVE_ANALYSIS_FRAMES)
+    peak_native_depth = np.full((dem["h"], dem["w"]), -np.inf, np.float32)
+    peak_native_speed = np.full((dem["h"], dem["w"]), -np.inf, np.float32)
+    peak_native_q = np.full((dem["h"], dem["w"]), -np.inf, np.float32)
+    arrival_native = np.full((dem["h"], dem["w"]), np.nan, np.float32)
+
+    for tn in tvals_native:
+        _, H_ln, Un, Vn = predict_native_field(model, dem, tn)
+        Sn = np.sqrt(Un ** 2 + Vn ** 2)
+        Qn = H_ln * Sn
+        peak_native_depth = np.maximum(peak_native_depth, np.where(np.isfinite(H_ln), H_ln, -np.inf))
+        peak_native_speed = np.maximum(peak_native_speed, np.where(np.isfinite(Sn), Sn, -np.inf))
+        peak_native_q = np.maximum(peak_native_q, np.where(np.isfinite(Qn), Qn, -np.inf))
+        hit = np.isnan(arrival_native) & np.isfinite(H_ln) & (H_ln >= ARRIVAL_DEPTH_THRESHOLD)
+        arrival_native[hit] = tn * T_END_SECONDS / 60.0
+
+    peak_native_depth[peak_native_depth == -np.inf] = np.nan
+    peak_native_speed[peak_native_speed == -np.inf] = np.nan
+    peak_native_q[peak_native_q == -np.inf] = np.nan
+
+    peak_native_depth[dem["ocean_mask"]] = np.nan
+    peak_native_speed[dem["ocean_mask"]] = np.nan
+    peak_native_q[dem["ocean_mask"]] = np.nan
+    arrival_native[dem["ocean_mask"]] = np.nan
+
+    peak_native_depth[~dem["valid_mask"]] = np.nan
+    peak_native_speed[~dem["valid_mask"]] = np.nan
+    peak_native_q[~dem["valid_mask"]] = np.nan
+    arrival_native[~dem["valid_mask"]] = np.nan
+
+    return {
+        "peak_H_land_plot": peak_H_land,
+        "peak_speed_land_plot": peak_speed_land,
+        "peak_q_land_plot": peak_q_land,
+        "arrival_min_plot": arrival_min,
+        "peak_H_land_native": peak_native_depth,
+        "peak_speed_land_native": peak_native_speed,
+        "peak_q_land_native": peak_native_q,
+        "arrival_min_native": arrival_native,
+        "rain_gif_path": rain_gif_path,
+        "depth_gif_path": depth_gif_path,
+        "speed_gif_path": speed_gif_path,
+        "discharge_gif_path": discharge_gif_path,
+        "peak_rain_mmhr": rain_max,
+        "peak_depth_m": safe_percentile(peak_native_depth, 99, 0.0),
+        "rain_cube": np.stack(rain_fields, axis=0).astype(np.float32),
+        "depth_cube": np.stack(flood_fields, axis=0).astype(np.float32),
+        "speed_cube": np.stack(speed_fields, axis=0).astype(np.float32),
+        "q_cube": np.stack(q_fields, axis=0).astype(np.float32),
+        "time_values": tvals,
+    }
+
+# ============================================================
+# RUN ONE CASE
+# ============================================================
+def run_case(case, dem, mesh):
+    case_name = case["name"]
+    slug = slugify(case_name)
+    case_dir = os.path.join(OUT_DIR, slug)
+    os.makedirs(case_dir, exist_ok=True)
+
+    print("\n" + "=" * 76)
+    print(f"[CASE] {case_name}")
+    print("=" * 76)
+
+    rainfall_fn = build_rainfall_fn(case)
+    model = FloodPINN(hidden=HIDDEN, layers=LAYERS, fourier=FOURIER, terrain_features=TERRAIN_FEATURES).to(DEVICE)
+    history = train_model(model, dem, mesh, rainfall_fn, epochs=EPOCHS_PER_CASE)
+
+    model_path = os.path.join(case_dir, f"{slug}_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"[SAVED] {model_path}")
+
+    loss_path = os.path.join(case_dir, f"{slug}_loss.png")
+    plot_loss(history, loss_path, f"{case_name} - training loss")
+
+    gif_path = os.path.join(case_dir, f"{slug}_hydraulic_response.gif")
+    gif_info = make_hydraulic_gif(model=model, dem=dem, rainfall_fn=rainfall_fn, out_path=gif_path, grid_res=GRID_RES, gif_frames=GIF_FRAMES, gif_fps=GIF_FPS)
+
+    peak_depth_map_path = os.path.join(case_dir, f"{slug}_peak_land_inundation_depth_map.png")
+    peak_speed_map_path = os.path.join(case_dir, f"{slug}_peak_land_flood_speed_map.png")
+    peak_q_map_path = os.path.join(case_dir, f"{slug}_peak_land_discharge_map.png")
+    arrival_map_path = os.path.join(case_dir, f"{slug}_arrival_time_map.png")
+
+    plot_peak_depth_map(gif_info["peak_H_land_plot"], dem, peak_depth_map_path, f"{case_name} - Peak Land Inundation Depth")
+    plot_peak_speed_map(gif_info["peak_speed_land_plot"], dem, peak_speed_map_path, f"{case_name} - Peak Land Flood Speed")
+    plot_peak_discharge_map(gif_info["peak_q_land_plot"], dem, peak_q_map_path, f"{case_name} - Peak Unit Discharge")
+    plot_arrival_time_map(gif_info["arrival_min_plot"], dem, arrival_map_path, f"{case_name} - Arrival Time")
+
+    save_numeric_outputs(
+        case_dir=case_dir,
+        slug=slug,
+        dem=dem,
+        peak_H_land=gif_info["peak_H_land_native"],
+        peak_speed_land=gif_info["peak_speed_land_native"],
+        peak_q_land=gif_info["peak_q_land_native"],
+        arrival_min=gif_info["arrival_min_native"],
+        rain_cube=gif_info["rain_cube"],
+        depth_cube=gif_info["depth_cube"],
+        speed_cube=gif_info["speed_cube"],
+        q_cube=gif_info["q_cube"],
+        time_values=gif_info["time_values"],
+    )
+
+    summary = {
+        "case": case_name,
+        "case_dir": case_dir,
+        "model_path": model_path,
+        "loss_plot": loss_path,
+        "gif_path": gif_path,
+        "rain_gif_path": gif_info["rain_gif_path"],
+        "depth_gif_path": gif_info["depth_gif_path"],
+        "speed_gif_path": gif_info["speed_gif_path"],
+        "discharge_gif_path": gif_info["discharge_gif_path"],
+        "peak_depth_map_path": peak_depth_map_path,
+        "peak_speed_map_path": peak_speed_map_path,
+        "peak_q_map_path": peak_q_map_path,
+        "arrival_map_path": arrival_map_path,
+        "peak_rain_mmhr": gif_info["peak_rain_mmhr"],
+        "peak_depth_m": gif_info["peak_depth_m"],
+    }
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return summary
+
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    dem = load_dem(DEM_PATH)
+    mesh = build_hydraulic_mesh(dem, mesh_m=HYDRAULIC_MESH_M)
+
+    context_map_path = os.path.join(OUT_DIR, "mumbai_context_hydraulic_mesh.png")
+    plot_hydraulic_context(dem, mesh, context_map_path, res=GRID_RES)
+
+    all_summaries = []
+    for case in SCENARIOS:
+        all_summaries.append(run_case(case, dem, mesh))
+
+    summary_plot_path = os.path.join(OUT_DIR, "scenario_comparison_hydraulic_mesh.png")
+    plot_summary_bar(all_summaries, summary_plot_path)
+
+    print("\n" + "=" * 76)
+    print("[DONE] Outputs created:")
+    print("=" * 76)
+    print(f"\nContext map: {context_map_path}")
+    for s in all_summaries:
+        print(f"\nCase: {s['case']}")
+        print(f"  Model            : {s['model_path']}")
+        print(f"  Loss             : {s['loss_plot']}")
+        print(f"  Combined GIF     : {s['gif_path']}")
+        print(f"  Rain GIF         : {s['rain_gif_path']}")
+        print(f"  Inundation GIF   : {s['depth_gif_path']}")
+        print(f"  Flow speed GIF   : {s['speed_gif_path']}")
+        print(f"  Discharge GIF    : {s['discharge_gif_path']}")
+        print(f"  Peak depth map   : {s['peak_depth_map_path']}")
+        print(f"  Peak speed map   : {s['peak_speed_map_path']}")
+        print(f"  Peak discharge   : {s['peak_q_map_path']}")
+        print(f"  Arrival time map : {s['arrival_map_path']}")
+        print(f"  Peak rain        : {s['peak_rain_mmhr']:.1f} mm/hr")
+        print(f"  Peak depth       : {s['peak_depth_m']:.2f} m")
+        print(f"  Numeric files    : saved in {s['case_dir']}")
+    print(f"\nScenario comparison plot: {summary_plot_path}")
+
+if __name__ == "__main__":
+    main()
